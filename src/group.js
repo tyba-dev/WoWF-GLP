@@ -166,7 +166,11 @@ $('#dlgGroup').addEventListener('click',async e=>{ const cfg=glpCfg(); const b=e
   if(b.dataset.glpmeet!=null){ const o=GLP_MEET?.top[+b.dataset.glpmeet]; if(!o) return; await glpApplyMeet(o,GLP_MEET.TR); glpRender(); toast('Meet-up applied: the others now follow '+GLP_MEET.TR[o.h].r.name+"'s route after meeting. Export the group guide to see it.",5000); return; }
   if(b.id==='glpUnmeet'){ for(const r of store.routes.filter(x=>x.glp===cfg.id)){ if(r.glpSolo){ r.steps=r.glpSolo; delete r.glpSolo; } delete r.glpMeet; } cursor=route.steps.length-1; PSIM.clear&&PSIM.clear(); refresh(); saveNow(); glpRender(); toast('Back to everyone on their own route.'); return; }
   if(b.id==='glpExport'){ const r=store.routes.find(x=>x.glp===cfg.id); if(!r) return; route=r; refresh(); $('#dlgGroup').close(); exportGroupGuide(); return; } });
-setTimeout(async()=>{ try{ if(!store.glp||!store.glp.built) await openGroup(); }catch(e){} },1500);
+/* one-off: an earlier build shared the Route Planner's storage; bring over just the group setup (not its routes) */
+async function glpMigrate(){ if(store.glp) return; try{ const old=JSON.parse(localStorage.getItem('frp.v1')||'null'); if(old?.glp){ store.glp={id:uid(),name:old.glp.name||'My group',members:old.glp.members||[],guides:[]}; save(); }
+    const db=await new Promise(res=>{ try{ const rq=indexedDB.open('frp-raw'); rq.onsuccess=()=>res(rq.result); rq.onerror=()=>res(null); rq.onupgradeneeded=()=>{ rq.transaction.abort(); res(null); }; }catch(e){ res(null); } });
+    if(db&&db.objectStoreNames.contains('kv')){ const v=await new Promise(res=>{ try{ const rq=db.transaction('kv').objectStore('kv').get('glp:guides'); rq.onsuccess=()=>res(rq.result??null); rq.onerror=()=>res(null); }catch(e){ res(null); } }); if(v){ await kvPut('glp:guides',v); GLP_TEXTS=null; } db.close(); } }catch(e){} }
+setTimeout(async()=>{ try{ await glpMigrate(); if(!store.glp||!store.glp.built) await openGroup(); }catch(e){} },1500);
 
 /* =====================================================================
    Meet-up options: who leaves their own route where, and joins whose route; ranked with fat-tailed pace uncertainty

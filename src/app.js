@@ -205,7 +205,7 @@ function whyUnavailable(qid,st,route){
 }
 
 /* ---------- routes & simulation ---------- */
-const LS='frp.v1';
+const LS='glp.v1'; /* own storage: the Route Planner on the same site uses frp.* */
 let store={routes:[],cur:null};
 let route=null, cursor=-1, SIM=null, selQuest=null;
 function uid(){ return Math.random().toString(36).slice(2,9); }
@@ -2006,7 +2006,7 @@ function buildGuideSteps(g,convert){
 }
 /* original guide text per block, kept in IndexedDB so exports can reproduce the guide verbatim */
 const rawCache=new Map(); let rawDBp=null;
-function rawDB(){ if(!rawDBp) rawDBp=new Promise((res)=>{ try{ const rq=indexedDB.open('frp-raw',2); rq.onupgradeneeded=()=>{ const d=rq.result; if(!d.objectStoreNames.contains('g')) d.createObjectStore('g'); if(!d.objectStoreNames.contains('kv')) d.createObjectStore('kv'); }; rq.onsuccess=()=>res(rq.result); rq.onerror=()=>res(null); }catch(e){ res(null); } }); return rawDBp; }
+function rawDB(){ if(!rawDBp) rawDBp=new Promise((res)=>{ try{ const rq=indexedDB.open('glp-raw',2); rq.onupgradeneeded=()=>{ const d=rq.result; if(!d.objectStoreNames.contains('g')) d.createObjectStore('g'); if(!d.objectStoreNames.contains('kv')) d.createObjectStore('kv'); }; rq.onsuccess=()=>res(rq.result); rq.onerror=()=>res(null); }catch(e){ res(null); } }); return rawDBp; }
 function kvPut(k,v){ return rawDB().then(db=>new Promise(res=>{ if(!db) return res(false); try{ const t=db.transaction('kv','readwrite'); t.objectStore('kv').put(v,k); t.oncomplete=()=>res(true); t.onerror=t.onabort=()=>res(false); }catch(e){ res(false); } })); }
 function kvDel(k){ rawDB().then(db=>{ try{ db&&db.transaction('kv','readwrite').objectStore('kv').delete(k); }catch(e){} }); }
 async function kvKeys(){ const db=await rawDB(); if(!db) return []; return new Promise(res=>{ try{ const rq=db.transaction('kv').objectStore('kv').getAllKeys(); rq.onsuccess=()=>res(rq.result||[]); rq.onerror=()=>res([]); }catch(e){ res([]); } }); }
