@@ -141,7 +141,7 @@ function glpRender(){ const cfg=glpCfg(); const mem=cfg.members; const adv=mem.l
     <div class="note">Camp buffs don't stack with a class buff of the same stat: the class buff overwrites it.</div></details>`; }
   h+=`<h4 style="margin:12px 0 4px">4 · Build</h4><div class="row" style="gap:6px;flex-wrap:wrap"><button class="btn gold" id="glpBuild">${cfg.built?'Rebuild':'Build'} member routes</button><button class="btn" id="glpExport"${cfg.built?'':' disabled'}>Export group guide</button></div><div id="glpMsg" class="note" style="margin-top:4px"></div>`;
   if(cfg.built){ const r0=store.routes.filter(x=>x.glp===cfg.id); const met=r0.some(x=>x.glpMeet);
-    h+=`<h4 style="margin:12px 0 4px">5 · Meet up</h4><div class="note">Where should the group get together? Members may leave their own route early when that's quicker overall.</div><div class="row" style="gap:6px"><button class="btn" id="glpFindMeet">Find meet-up options</button>${met?'<button class="btn sm" id="glpUnmeet">Undo meet-up (back to solo routes)</button>':''}</div><div id="glpMeet">${glpMeetHTML()}</div>`; }
+    h+=`<h4 style="margin:12px 0 4px">5 · Meet up</h4><div class="note">Where should the group get together? Members may leave their own route early when that's quicker overall.</div><div class="row" style="gap:6px;flex-wrap:wrap;align-items:center"><button class="btn" id="glpFindMeet">Find meet-up options</button><span class="note">or your own spot:</span><select id="glpCHost">${r0.map((r,i)=>`<option value="${i}"${i===(GLP_CUST.h??0)?' selected':''}>${esc(r.name)}'s route</option>`).join('')}</select><select id="glpCStep" style="max-width:340px">${glpSpotOpts(r0[GLP_CUST.h??0])}</select><button class="btn sm" id="glpCustom">Compare my spot</button>${met?'<button class="btn sm" id="glpUnmeet">Undo meet-up (back to solo routes)</button>':''}</div><div id="glpMeet">${glpMeetHTML()}</div>`; }
   if(cfg.report) h+=cfg.report.map(r=>`<div style="margin-top:4px"><b>${esc(r.name)}</b> <span class="note">${r.steps} steps from ${r.guides} guide${r.guides===1?'':'s'}</span>${r.notes.map(n=>`<div class="note">• ${esc(n)}</div>`).join('')}</div>`).join('');
   $('#glpBody').innerHTML=h; }
 async function openGroup(){ await glpTexts(); glpRender(); $('#dlgGroup').showModal(); }
@@ -150,6 +150,7 @@ $('#glpClose').addEventListener('click',()=>$('#dlgGroup').close());
 $('#dlgGroup').addEventListener('change',async e=>{ const t=e.target; const cfg=glpCfg();
   if(t.id==='glpName'){ cfg.name=t.value; save(); return; }
   if(t.id==='glpFile'){ const T=await glpTexts(); for(const f of t.files){ const text=await f.text(); if(!parseRXP(text).length){ toast(`${f.name}: no RestedXP guide found`,3000); continue; } const k=T.findIndex(x=>x.name===f.name); if(k>=0) T[k]={name:f.name,text}; else T.push({name:f.name,text}); } await kvPut('glp:guides',JSON.stringify(T)); t.value=''; glpRender(); return; }
+  if(t.id==='glpCHost'){ GLP_CUST.h=+t.value; GLP_CUST.j=null; glpRender(); return; }
   const tr=t.closest('[data-glpm]'); if(!tr) return; const m=cfg.members[+tr.dataset.glpm]; const k=t.dataset.k;
   if(k==='name') m.name=t.value.trim()||m.name; else if(k==='race'){ m.race=t.value; } else if(k==='cls') m.cls=t.value; else if(k==='camp') m.camp=t.value;
   else if(k==='p0'||k==='p1'){ const pr=[...(m.profs||[])]; pr[k==='p0'?0:1]=t.value||undefined; m.profs=pr.filter(Boolean); }
@@ -161,6 +162,7 @@ $('#dlgGroup').addEventListener('click',async e=>{ const cfg=glpCfg(); const b=e
   if(b.dataset.glpdelg!=null){ const T=await glpTexts(); T.splice(+b.dataset.glpdelg,1); await kvPut('glp:guides',JSON.stringify(T)); glpRender(); return; }
   if(b.id==='glpBuild'){ b.disabled=true; try{ await glpBuild(); } catch(err){ console.error(err); $('#glpMsg').textContent='Build failed: '+err.message; } finally{ b.disabled=false; } return; }
   if(b.id==='glpFindMeet'){ const rs=store.routes.filter(x=>x.glp===cfg.id); if(rs.length<2) return toast('A meet-up needs at least two members.'); b.disabled=true; b.textContent='Working…'; await rawLoad(rs.flatMap(r=>(r.guides||[]).map(g=>g.id))); await new Promise(r=>setTimeout(r,20)); try{ GLP_MEET=glpMeetOptions(rs); }catch(err){ console.error(err); toast('Failed: '+err.message,4000); } glpRender(); return; }
+  if(b.id==='glpCustom'){ const rs=store.routes.filter(x=>x.glp===cfg.id); GLP_CUST.h=+$('#glpCHost').value; GLP_CUST.j=+$('#glpCStep').value; b.disabled=true; b.textContent='Working…'; await rawLoad(rs.flatMap(r=>(r.guides||[]).map(g=>g.id))); await new Promise(r=>setTimeout(r,20)); try{ GLP_MEET=glpMeetOptions(rs,{h:GLP_CUST.h,j:GLP_CUST.j}); }catch(err){ console.error(err); toast('Failed: '+err.message,4000); } glpRender(); return; }
   if(b.dataset.glpmeet!=null){ const o=GLP_MEET?.top[+b.dataset.glpmeet]; if(!o) return; await glpApplyMeet(o,GLP_MEET.TR); glpRender(); toast('Meet-up applied: the others now follow '+GLP_MEET.TR[o.h].r.name+"'s route after meeting. Export the group guide to see it.",5000); return; }
   if(b.id==='glpUnmeet'){ for(const r of store.routes.filter(x=>x.glp===cfg.id)){ if(r.glpSolo){ r.steps=r.glpSolo; delete r.glpSolo; } delete r.glpMeet; } cursor=route.steps.length-1; PSIM.clear&&PSIM.clear(); refresh(); saveNow(); glpRender(); toast('Back to everyone on their own route.'); return; }
   if(b.id==='glpExport'){ const r=store.routes.find(x=>x.glp===cfg.id); if(!r) return; route=r; refresh(); $('#dlgGroup').close(); exportGroupGuide(); return; } });
@@ -189,23 +191,23 @@ function glpTravel(a,b,L,fac){ if(!a||!b) return {s:0,cross:false}; const ma=MET
   for(const [f,z,lv,nm] of GLP_DANGER) if((!fac||f===fac)&&best.via.includes(z)&&L<lv-5){ const pen=Math.min(1200,(lv-L)*60); best.s+=pen; best.danger=`walks through ${nm} (level ${lv}+) at level ${L}`; }
   return best; }
 function tSample(){ const g=()=>{ let u=0,v=0; while(!u) u=Math.random(); while(!v) v=Math.random(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }; const z=g(); const c=g()**2+g()**2+g()**2; return Math.max(-4,Math.min(4,z/Math.sqrt(c/3))); } /* Student t, 3 d.o.f.: fat tails */
-function glpMeetOptions(routes){ const TR=routes.map(glpTrack); const N=TR.length;
+function glpMeetOptions(routes,custom){ const TR=routes.map(glpTrack); const N=TR.length;
   const Xlv=Math.min(...TR.map(t=>t.L[t.n-1])); const TX=TR.map(t=>{ const i=t.L.findIndex(l=>l>=Xlv); return t.T[i<0?t.n-1:i]; });
   const cand=t=>{ const out=new Set(); const s=Math.max(1,Math.floor(t.n/90)); for(let i=0;i<t.n;i++){ if(!t.P[i]||t.L[i]>=Xlv) continue; if(i%s===0||(i>0&&t.G[i]!==t.G[i-1])||(i>0&&t.P[i-1]&&t.P[i].z!==t.P[i-1].z)) out.add(i); } return [...out]; };
   const C=TR.map(cand);
   const rate=(t,e)=>{ let k=e; while(k>0&&t.T[e]-t.T[k]<1800) k--; const dx=t.X[e]-t.X[k], dt=t.T[e]-t.T[k]; return dx>0&&dt>0?dx/dt:Math.max(.5,t.X[e]/Math.max(60,t.T[e])); };
   const opts=[];
   const allCan=(H,j)=>{ const st=(H.r.glpSolo||H.r.steps)[j]; const g=st?.src&&!st.src.auto?G2(H.r,st.src.g):null; const c=glpStepCond(H.r,st); if(!st||st.glp||['prof','train','buy'].includes(st.t)) return false; const q=st.q?Q(st.q):null; if(q?.ra&&TR.some(t=>t.ci.rb&&!(q.ra&t.ci.rb))) return false; return !c||TR.every(t=>condFor(c,t.r)); };
-  for(let h=0;h<N;h++){ const H=TR[h]; for(const j of C[h]){ const pj=H.P[j]; if(!allCan(H,j)) continue; /* never meet on a step only the host can do (class trips, race quests) */ const es=[]; let ok=true; let mean=H.T[j];
+  for(let h=0;h<N;h++){ const H=TR[h]; const js=custom&&custom.h===h?[...C[h],custom.j]:C[h]; for(const j of js){ const pj=H.P[j]; const isC=custom&&custom.h===h&&custom.j===j; if(!pj) continue; if(!isC&&!allCan(H,j)) continue; /* never meet on a step only the host can do (class trips, race quests) */ const es=[]; let ok=true; let mean=H.T[j];
       for(let m=0;m<N;m++){ if(m===h){ es.push(null); continue; } const M=TR[m]; let best=null; const cs=[];
         /* if this member's own route reaches the same step, they simply carry on to it (same zone, no detour) */
         const hss=H.r.glpSolo||H.r.steps; const ms=M.r.glpSolo||M.r.steps; const sg=x=>x&&x.q?x.t+':'+x.q:null; const idx=new Map(); ms.forEach((x,i)=>{ const k=sg(x); if(k&&!idx.has(k)) idx.set(k,i); }); let k=-1; for(let jj=j;jj<Math.min(hss.length,j+40)&&k<0;jj++){ const kk=idx.get(sg(hss[jj])); if(kk!=null) k=kk; }
         for(const e of (k>0?[k-1]:C[m])){ const tr=glpTravel(M.P[e],pj,M.L[e],M.ci.fac); const arr=M.T[e]+tr.s; const def=Math.max(0,H.X[j]-M.X[e]); const cu=def/rate(M,e); const ready=Math.max(arr+cu,H.T[j]); cs.push({e,T:M.T[e],cu,tr}); if(!best||ready<best.ready-60||(Math.abs(ready-best.ready)<=60&&e>best.e)) best={e,ready,tr,cu,arr}; } /* same meet time: keep questing on your own route as long as possible */
         if(!best){ ok=false; break; } best.cs=cs; es.push(best); mean=Math.max(mean,best.ready); }
-      if(!ok) continue; opts.push({h,j,es,mean,C:mean+(TX[h]-H.T[j])}); } }
+      if(!ok) continue; const o={h,j,es,mean,C:mean+(TX[h]-H.T[j])}; if(isC){ o.custom=true; o.cannot=!allCan(H,j); } opts.push(o); } }
   /* one option per host and zone (the best moment to meet there) */
   const by=new Map(); for(const o of opts){ const k=o.h+'|'+TR[o.h].P[o.j].z; if(!by.has(k)||o.C<by.get(k).C) by.set(k,o); }
-  const top=[...by.values()].sort((a,b)=>a.C-b.C).slice(0,8);
+  const top=[...by.values()].filter(o=>!o.custom).sort((a,b)=>a.C-b.C).slice(0,8); const co=opts.find(o=>o.custom); if(co) top.push(co);
   /* Monte Carlo: shared launch factor, each member's own pace (busy starter zones: wider), travel noise; same draws for every option */
   const D=600; const sig=m=>{ const k=TR[m].L.findIndex(l=>l>=12); return k<0||k>TR[m].n*0.3?0.35:0.25; };
   const draws=Array.from({length:D},()=>({c:Math.exp(0.2*tSample()),f:TR.map((_,m)=>Math.exp(sig(m)*tSample())),t:TR.map(()=>Math.exp(0.25*tSample()))}));
@@ -222,7 +224,7 @@ function glpMeetOptions(routes){ const TR=routes.map(glpTrack); const N=TR.lengt
   draws.forEach((d,k)=>{ let b=null; for(const o of top) if(!b||o.Cs[k]<b.Cs[k]) b=o; if(!b) return; b.win++; const fast=d.f.indexOf(Math.min(...d.f)); b.winBy[fast]++; });
   const fastN=Array(N).fill(0); draws.forEach(d=>fastN[d.f.indexOf(Math.min(...d.f))]++);
   for(const o of top){ o.win/=D; o.winBy=o.winBy.map((w,m)=>fastN[m]?w/fastN[m]:0);
-    o.es=o.es.map((x,m)=>{ if(!x) return x; const e=o.exitR[m][1]; return {...x,...(x.cs.find(c=>c.e===e)||{}),e}; }); o.cc=glpConcerns(o,TR,Xlv); }
+    o.es=o.es.map((x,m)=>{ if(!x) return x; const e=o.exitR[m][1]; return {...x,...(x.cs.find(c=>c.e===e)||{}),e}; }); o.cc=glpConcerns(o,TR,Xlv); if(o.cannot) o.cc.unshift('Not everyone can do this step (race/class/profession only): meet just before or after it.'); }
   top.sort((a,b)=>a.cMean-b.cMean); return {TR,top,Xlv,D}; }
 function glpConcerns(o,TR,Xlv){ const out=[]; const H=TR[o.h]; const pj=H.P[o.j];
   o.es.forEach((x,m)=>{ if(!x) return; const M=TR[m]; const nm=M.r.name;
@@ -255,11 +257,13 @@ async function glpApplyMeet(o,TR){ const H=TR[o.h]; const host=H.r; const pj=H.P
     for(let it=0;it<8;it++){ simulate(); const i=r.steps.findIndex((x,i)=>!keep.has(x.id)&&/Requires level \d+/.test((SIM.res[i]?.err||[]).join(' '))); if(i<0) break; const L=+(SIM.res[i].err.join(' ').match(/Requires level (\d+)/)[1]); r.steps.splice(i,0,{id:uid(),t:'grind',mode:'to',level:L,xp:0,note:'Catch up with the group',glp:1}); }
     route=R0; }
   host.glpMeet={h:host.id,j:o.j}; cursor=route.steps.length-1; PSIM.clear&&PSIM.clear(); FQ.key=null; refresh(); saveNow(); }
-let GLP_MEET=null;
+let GLP_MEET=null; const GLP_CUST={h:0,j:null};
+function glpSpotOpts(r){ if(!r) return ''; const R0=route,st0=r.steps; route=r; if(r.glpSolo) r.steps=r.glpSolo; let out=''; try{ simulate(); let prev=''; r.steps.forEach((x,i)=>{ const p=SIM.res[i]?.pt; if(!p||SIM.res[i].stk||x.glp) return; const nm=glpPlaceName(p); if(nm===prev) return; prev=nm;
+    out+=`<option value="${i}"${GLP_CUST.j===i?' selected':''}>Step ${i+1} · lvl ${SIM.res[i].before?.level||1} · ${esc(nm)}</option>`; }); } finally{ r.steps=st0; route=R0; simulate(); } return out; }
 function glpMeetHTML(){ if(!GLP_MEET) return ''; const {TR,top,Xlv,D}=GLP_MEET; const N=TR.length; const nm=m=>`<b style="color:${CLS_COL[TR[m].r.char.cls]}">${esc(TR[m].r.name)}</b>`;
   return `<div class="note" style="margin:4px 0">Ranked by the expected time until everyone is level ${Xlv}. Each option uses ${D} simulated launches: a shared “how busy is the server” factor, each player's own pace (fat-tailed, wider in starter zones) and travel delays.</div>`+
   top.map((o,k)=>{ const H=TR[o.h]; const pj=H.P[o.j];
-    return `<div style="border:1px solid var(--line);border-radius:8px;padding:6px 8px;margin:6px 0"><div><b>${k+1}. Meet at ${esc(glpPlaceName(pj))}</b> on ${nm(o.h)}'s route (their step ${o.j+1}, level ${H.L[o.j]}) <span class="note">· best in ${Math.round(o.win*100)}% of simulations</span></div>
+    return `<div style="border:1px solid ${o.custom?'var(--gold,#ffcd46)':'var(--line)'};border-radius:8px;padding:6px 8px;margin:6px 0"><div>${o.custom?'<span class="note" style="color:#ffcd46">★ Your spot · </span>':''}<b>${k+1}. Meet at ${esc(glpPlaceName(pj))}</b> on ${nm(o.h)}'s route (their step ${o.j+1}, level ${H.L[o.j]}) <span class="note">· best in ${Math.round(o.win*100)}% of simulations</span></div>
     <div class="note">Meet after ~${fmtT(o.p50)} <span title="10th–90th percentile">(likely ${fmtT(o.p10)}–${fmtT(o.p90)})</span> · everyone level ${Xlv} after ~${fmtT(o.cMean)}</div>
     ${o.es.map((x,m)=>{ const R=o.exitR[m]; const lst=`the one everyone waits for in ${Math.round(o.last[m]*100)}% of runs`;
       return x?`<div class="note">• ${nm(m)} leaves their route around step ${R[1]+1} (level ${TR[m].L[R[1]]}, ${esc(zoneName(TR[m].P[R[1]]?.z))}; anywhere from step ${R[0]+1} to ${R[2]+1} depending on pace), ${x.tr.s>30?'~'+fmtT(x.tr.s)+' travel':'already there'}. They're ${lst}; idle ~${fmtT(o.wait[m])} on average.</div>`:`<div class="note">• ${nm(m)} carries on with their route to step ${o.j+1}. They're ${lst}; idle ~${fmtT(o.wait[m])} on average.</div>`; }).join('')}
