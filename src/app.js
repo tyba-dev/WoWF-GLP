@@ -1,0 +1,2417 @@
+const BUILD='__BUILD__'; // stamped at build time
+'use strict';
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = n => Math.round(n).toLocaleString('en-US');
+let DB, META;
+
+const XP_TABLE=[0,400,900,1400,2100,2800,3600,4500,5400,6500,7600,8800,10100,11400,12900,14400,16000,17700,19400,21300,23200,25200,27300,29400,31700,34000,36400,38900,41400,44300,47400,50800,54500,58600,62800,67100,71600,76100,80800,85700,90700,95800,101000,106300,111800,117500,123200,129100,135100,141200,147500,153900,160400,167100,173900,180800,187900,195000,202300,209800];
+const MAXLVL=60;
+const START={Human:[12,48.2,42.5],Dwarf:[1,29.9,71.2],Gnome:[1,29.9,71.2],'Night Elf':[141,58.6,44.2],Orc:[14,43.3,68.5],Troll:[14,43.3,68.5],Undead:[85,30.8,66.2],Tauren:[215,44.2,76.7]};
+const RACES={Human:[1,'A'],Dwarf:[4,'A'],'Night Elf':[8,'A'],Gnome:[64,'A'],Orc:[2,'H'],Undead:[16,'H'],Tauren:[32,'H'],Troll:[128,'H'],Skyborne:[0,null]};
+const CLASSES={Warrior:1,Paladin:2,Hunter:4,Rogue:8,Priest:16,Shaman:64,Mage:128,Warlock:256,Druid:1024};
+const FMASK={A:77,H:178};
+const PROF_SORTS=new Set([-324,-304,-264,-201,-182,-181,-121,-101,-24]);
+const EVENT_SORTS=new Set([-22,-364,-366,-369,-370,-1002,-1003,-1004,-41,-25]);
+const CLASS_SORT_NAME={'-263':'Druid','-262':'Priest','-261':'Hunter','-162':'Rogue','-161':'Mage','-141':'Paladin','-82':'Shaman','-81':'Warrior','-61':'Warlock'};
+
+async function loadData(){
+  const b64=document.getElementById('bundle').textContent.trim();
+  const bin=atob(b64); const u8=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
+  const stream=new Blob([u8]).stream().pipeThrough(new DecompressionStream('gzip'));
+  const o=JSON.parse(await new Response(stream).text());
+  DB=o.db; META=o.meta; for(const [id,x] of Object.entries(QEXTRA)) if(DB.q[id]) Object.assign(DB.q[id],x);
+  labelChains();
+}
+/* quests that share a name and form a chain get "(part k/n)" so follow-ups are distinguishable */
+function labelChains(){
+  const byName=new Map();
+  for(const [id,q] of Object.entries(DB.q)){ q.on=q.n; const k=q.n+'|'+(q.ra||0); if(!byName.has(k)) byName.set(k,[]); byName.get(k).push(+id); }
+  for(const ids of byName.values()){
+    if(ids.length<2) continue; const set=new Set(ids);
+    const pre=id=>[...(DB.q[id].ps||[]),...(DB.q[id].pg||[])].filter(p=>set.has(p));
+    if(!ids.some(id=>pre(id).length)) continue;
+    const memo=new Map(); const depth=(id,seen=new Set())=>{ if(memo.has(id)) return memo.get(id); if(seen.has(id)) return 0; seen.add(id); const p=pre(id); const d=p.length?1+Math.max(...p.map(x=>depth(x,seen))):0; memo.set(id,d); return d; };
+    const sorted=[...ids].sort((a,b)=>depth(a)-depth(b)||a-b);
+    sorted.forEach((id,i)=>{ DB.q[id].n=`${DB.q[id].on} (${i+1}/${sorted.length})`; });
+  }
+}
+
+/* ---------- geometry ---------- */
+function zp2plane(z,px,py){
+  const Z=META.zones[z]; if(!Z) return null;
+  const [L,R,T,B]=Z.b; const off=META.off[Z.m];
+  const wy=L-px/100*(L-R), wx=T-py/100*(T-B);
+  return {X:-wy+off[0], Y:-wx+off[1], z:+z, px, py};
+}
+function plane2zone(X,Y){
+  let best=null;
+  for(const [z,Z] of Object.entries(META.zones)){
+    const off=META.off[Z.m]; const [L,R,T,B]=Z.b;
+    const wy=-(X-off[0]), wx=-(Y-off[1]);
+    const px=(L-wy)/(L-R)*100, py=(T-wx)/(T-B)*100;
+    if(px<0||px>100||py<0||py>100) continue;
+    const area=Math.abs((L-R)*(T-B));
+    let inPoly=false; const P=zonePaths.get(+z);
+    if(P && mctx.isPointInPath(P,X,Y)) inPoly=true;
+    const score=(Z.city?0:1e9)+(inPoly?0:1e10)+area;
+    if(!best||score<best.score) best={z:+z,px:+px.toFixed(1),py:+py.toFixed(1),score};
+  }
+  return best;
+}
+const zoneName=z=>META.zones[z]?.n || META.areas[z]?.[0] || ('Zone '+z);
+function areaLabel(q){
+  const z=q.z; if(!z) return 'Unknown';
+  if(z<0) return META.sorts[z]||'Special';
+  const a=META.areas[z]; if(!a) return zoneName(z);
+  const parent=META.areas[a[1]]; return (a[1]!==z && META.zones[a[1]]) ? META.zones[a[1]].n : a[0];
+}
+
+/* ---------- entities & quests ---------- */
+const ptCache=new Map();
+function entPts(type,id){
+  const key=type+id; if(ptCache.has(key)) return ptCache.get(key);
+  const rec=(type==='n'?DB.n:DB.o)[id]; const out=[];
+  if(rec&&rec.p) for(const [z,x,y,d] of rec.p){ const p=zp2plane(z,x,y); if(p){ p.dg=!!d; p.ent=type+id; out.push(p);} }
+  ptCache.set(key,out); return out;
+}
+const entName=(type,id)=>((type==='n'?DB.n:DB.o)[id]?.n)||(type==='n'?'NPC ':'Object ')+id;
+const Q=id=>DB.q[id];
+function starterPts(qid){
+  const q=Q(qid); const out=[];
+  for(const id of q.s.n) out.push(...entPts('n',id).map(p=>({...p,label:entName('n',id)})));
+  for(const id of q.s.o) out.push(...entPts('o',id).map(p=>({...p,label:entName('o',id)})));
+  if(!out.length&&q.s.i.length) return itemStartPts(qid);
+  return out;
+}
+function finisherPts(qid){
+  const q=Q(qid); const out=[];
+  for(const id of q.f.n) out.push(...entPts('n',id).map(p=>({...p,label:entName('n',id)})));
+  for(const id of q.f.o) out.push(...entPts('o',id).map(p=>({...p,label:entName('o',id)})));
+  return out;
+}
+const isItemStart=qid=>{ const q=Q(qid); return !!q&&!q.s.n.length&&!q.s.o.length&&q.s.i.length>0; };
+function itemStartPts(qid){ /* one representative spot per dropping mob/object: the spawn nearest that mob's centre */ const out=[]; const IS=new Map();
+  for(const i of Q(qid).s.i){ const it=DB.i[i]; if(!it) continue; for(const [t,ids] of [['n',it.d||[]],['o',it.od||[]]]) for(const id of ids.slice(0,4)){ const ps=entPts(t,id).filter(p=>!p.dg); if(!ps.length) continue; const mx=ps.reduce((a,p)=>a+p.X,0)/ps.length, my=ps.reduce((a,p)=>a+p.Y,0)/ps.length; const c=ps.reduce((b,p)=>Math.hypot(p.X-mx,p.Y-my)<Math.hypot(b.X-mx,b.Y-my)?p:b); out.push({...c,label:entName(t,id)+' (drops '+(it.n||'item')+')',item:i}); } }
+  return out; }
+function itemSourcePts(iid,kind){
+  const it=DB.i[iid]; const out=[]; if(!it) return out;
+  for(const id of it.d||[]) out.push(...entPts('n',id).map(p=>({...p,kind,label:entName('n',id)})));
+  for(const id of it.od||[]) out.push(...entPts('o',id).map(p=>({...p,kind,label:entName('o',id)})));
+  if(!out.length) for(const id of it.v||[]) out.push(...entPts('n',id).map(p=>({...p,kind:'buy',label:entName('n',id)+' (vendor)'})));
+  return out;
+}
+const objCache=new Map();
+function objectives(qid){
+  if(objCache.has(qid)) return objCache.get(qid);
+  const q=Q(qid); const o=q.o||{}; const list=[];
+  for(const [id,txt] of o.c||[]) list.push({kind:'kill',id,text:txt||('Slay '+entName('n',id)),pts:entPts('n',id).map(p=>({...p,kind:'kill',label:entName('n',id)}))});
+  for(const [id,txt] of o.o||[]) list.push({kind:'obj',text:txt||entName('o',id),pts:entPts('o',id).map(p=>({...p,kind:'obj',label:entName('o',id)}))});
+  for(const [id,txt] of o.i||[]) list.push({kind:'loot',id,text:txt||(DB.i[id]?.n||('Item '+id)),pts:itemSourcePts(id,'loot')});
+  for(const [ids,base,txt] of o.k||[]){ const pts=[]; for(const id of [...ids,...(base?[base]:[])]) pts.push(...entPts('n',id).map(p=>({...p,kind:'kill',label:entName('n',id)}))); list.push({kind:'kill',text:txt||entName('n',base||ids[0]),pts}); }
+  for(const s of o.s||[]) list.push({kind:'event',text:s,pts:[]});
+  if(o.r) list.push({kind:'rep',text:'Reach reputation '+o.r[1]+' with faction '+o.r[0],pts:[]});
+  if(q.te){ const pts=q.te[1].map(([z,x,y])=>zp2plane(z,x,y)).filter(Boolean).map(p=>({...p,kind:'event',label:q.te[0]})); list.push({kind:'event',text:q.te[0],pts}); }
+  { let n=1; for(const ob of list){ if(ob.kind==='rep'||(ob.kind==='event'&&!ob.pts.length&&!q.te)) continue; ob.rx=n++; } }
+  (q.xk||[]).forEach((id,k)=>list.push({kind:'kill',text:entName('n',id)+' slain',pts:entPts('n',id).map(p=>({...p,kind:'kill',label:entName('n',id)})),rx:100+k,extra:true}));
+  // items you must loot first (Questie requiredSourceItems), e.g. Samuel's Remains from Samuel Fipps: shown and routed, but not numbered (RestedXP .complete numbers stay Questie's)
+  for(const id of q.rs||[]){ if((o.i||[]).some(([i])=>i===id)) continue; const pts=itemSourcePts(id,'loot'); if(pts.length) list.push({kind:'loot',text:(DB.i[id]?.n||('Item '+id))+' (loot first)',pts,pre:true}); }
+  for(const ob of list){ if(ob.pts.length>160){ const st=ob.pts.length/160; ob.pts=Array.from({length:160},(_,i)=>ob.pts[Math.floor(i*st)]); } }
+  objCache.set(qid,list); return list;
+}
+const dqCache=new Map();
+function isDungeonQuest(qid){ if(dqCache.has(qid)) return dqCache.get(qid); const q=Q(qid); let v=false;
+  if(q){ if(q.z>0 && META.dgAreas.includes(q.z)) v=true; else { const pts=objectives(qid).flatMap(o=>o.pts); if(pts.length && pts.filter(p=>p.dg).length>=pts.length/2) v=true; } }
+  dqCache.set(qid,v); return v; }
+function objNums(qid){ return objectives(qid).filter(o=>o.rx).map(o=>o.rx); }
+const hasObjectives=qid=>{ const q=Q(qid); return !!(q.o||q.te||q.xk); };
+// objectives the game doesn't list but the quest needs (Forever): kill these to be able to hand in. Not exported as .complete (the quest has no such objective).
+const QEXTRA={6383:{xk:[12676,12677,12678],note:'Kill Sharptalon, Shadumbra and Ursangous, then hand in to Senani Thunderheart'}};
+
+function objPoint(qid,rx,ref){
+  let all=objectives(qid).filter(o=>!o.pre&&(!rx||o.rx===rx)).flatMap(o=>o.pts); if(!all.length) return rx?objPoint(qid,null,ref):null;
+  let pts=all.filter(p=>!p.dg); if(!pts.length) pts=all;
+  // cluster points ~300 yd grid, pick the densest cluster weighted by distance from the previous step
+  const cl=new Map(); for(const p of pts){ const k=Math.round(p.X/300)+','+Math.round(p.Y/300); if(!cl.has(k)) cl.set(k,[]); cl.get(k).push(p); }
+  let best=null,bs=-1e18; for(const g of cl.values()){ const mx=g.reduce((s,p)=>s+p.X,0)/g.length, my=g.reduce((s,p)=>s+p.Y,0)/g.length; const d=ref?Math.hypot(mx-ref.X,my-ref.Y):0; const sc=g.length*400-d; if(sc>bs){ bs=sc; best={g,mx,my}; } }
+  let bp=best.g[0],bd=1e18; for(const p of best.g){ const d=(p.X-best.mx)**2+(p.Y-best.my)**2; if(d<bd){bd=d;bp=p;} }
+  return {...bp,wp:true};
+}
+function objCentroid(qid){
+  const all=objectives(qid).flatMap(o=>o.pts); let pts=all.filter(p=>!p.dg); if(!pts.length) pts=all;
+  if(!pts.length) return null;
+  const byZ={}; for(const p of pts) (byZ[p.z]=byZ[p.z]||[]).push(p);
+  const zs=Object.values(byZ).sort((a,b)=>b.length-a.length)[0];
+  const mx=zs.reduce((s,p)=>s+p.X,0)/zs.length, my=zs.reduce((s,p)=>s+p.Y,0)/zs.length;
+  let best=zs[0],bd=1e18; for(const p of zs){ const d=(p.X-mx)**2+(p.Y-my)**2; if(d<bd){bd=d;best=p;} }
+  return best;
+}
+
+/* ---------- xp ---------- */
+function questXP(qid,level){
+  const q=Q(qid); if(!q||!q.xp||level>=MAXLVL) return 0;
+  const [ql,b0]=q.xp; const base=isDungeonQuest(qid)?b0*dqMult():b0; let mult=2*(ql-level)+20; mult=Math.max(1,Math.min(10,mult));
+  let xp=base*mult/10;
+  if(xp<=100) xp=5*Math.floor((xp+2)/5); else if(xp<=500) xp=10*Math.floor((xp+5)/10); else if(xp<=1000) xp=25*Math.floor((xp+12)/25); else xp=50*Math.floor((xp+25)/50);
+  return Math.floor(xp);
+}
+function dqMult(){ const m=+route?.char?.dqmult; return m>0?m:2.5; }
+function addXP(st,amt){
+  st.xp+=amt;
+  while(st.level<MAXLVL && st.xp>=XP_TABLE[st.level]){ st.xp-=XP_TABLE[st.level]; st.level++; }
+  if(st.level>=MAXLVL){ st.level=MAXLVL; st.xp=0; }
+}
+const totalXP=(level,xp)=>{ let t=xp; for(let l=1;l<level;l++) t+=XP_TABLE[l]; return t; };
+const fromTotal=t=>{ let l=1; while(l<MAXLVL&&t>=XP_TABLE[l]){ t-=XP_TABLE[l]; l++; } return {level:l,xp:l>=MAXLVL?0:Math.round(t)}; };
+function grayLevel(l){ return l<=5?0 : l<=39? l-5-Math.floor(l/10) : l-1-Math.floor(l/5); }
+function diffClass(ql,l){ const d=ql-l; if(d>=5) return 'red'; if(d>=3) return 'orange'; if(d>=-2) return 'yellow'; if(ql>grayLevel(l)) return 'green'; return 'grey'; }
+function zeroDiff(l){ return l<8?5:l<10?6:l<12?7:l<16?8:l<20?9:l<30?11:l<40?12:l<45?13:l<50?14:l<55?15:16; }
+function mobXP(player,mob,elite,party,dgFactor){
+  if(player>=MAXLVL) return 0;
+  const base=player*5+45; let xp;
+  if(mob>=player) xp=base*(1+0.05*Math.min(mob-player,4));
+  else { if(mob<=grayLevel(player)) return 0; xp=base*(1-(player-mob)/zeroDiff(player)); }
+  if(dgFactor) xp*=dgFactor; else if(elite) xp*=2;
+  const bonus=[1,1,1,1.166,1.3,1.4][party]||1;
+  return Math.max(0,Math.round(xp*bonus/party));
+}
+
+/* ---------- availability ---------- */
+function charInfo(r){ const c=r.char; const [rb,fac]=RACES[c.race]||[0,c.faction]; return {rb,fac:fac||c.faction,cb:CLASSES[c.cls]||0,opts:c}; }
+function whyUnavailable(qid,st,route){
+  const q=Q(qid); const ci=charInfo(route);
+  if(q.ra){ if(ci.rb){ if(!(q.ra&ci.rb)) return {hard:true,why:'Not available to your race'}; } else if((q.ra&FMASK[ci.fac])!==FMASK[ci.fac]) return {hard:true,why:'Restricted to specific races'}; }
+  if(q.cl && !(q.cl&ci.cb)) return {hard:true,why:'Class quest for another class'};
+  if(q.z<0 && CLASS_SORT_NAME[q.z] && CLASS_SORT_NAME[q.z]!==route.char.cls) return {hard:true,why:'Class quest for another class'};
+  for(const nid of q.s.n){ const fr=DB.n[nid]?.fr; if(fr && !fr.includes(ci.fac)) return {hard:true,why:'Quest giver is hostile to your faction'}; }
+  if(q.sk && !ci.opts.prof && !q.fv) return {hard:true,filter:true,why:'Profession quest (enable in Settings)'};
+  if(q.z<0 && PROF_SORTS.has(q.z) && !ci.opts.prof && !q.fv) return {hard:true,filter:true,why:'Profession quest (enable in Settings)'};
+  if((q.ev || (q.z<0&&EVENT_SORTS.has(q.z))) && !ci.opts.event) return {hard:true,filter:true,why:'Seasonal or event quest (enable in Settings)'};
+  if((q.sf||0)&1 && !ci.opts.rep) return {hard:true,filter:true,why:'Repeatable quest (enable in Settings)'};
+  if(st.turned.has(qid)) return {why:'Already turned in'};
+  if(st.log.has(qid)) return {why:'Already in your quest log'};
+  if(q.pg){ const miss=q.pg.filter(p=>!st.turned.has(p)&&Q(p)); if(miss.length) return {why:'Requires: '+miss.map(p=>Q(p).n).join(', '),pre:miss}; }
+  if(q.ps){ const have=q.ps.some(p=>st.turned.has(p)||!Q(p)); if(!have) return {why:'Requires one of: '+q.ps.filter(Q).map(p=>Q(p).n).join(', '),pre:q.ps}; }
+  if(q.ex){ const hit=q.ex.find(p=>st.turned.has(p)||st.log.has(p)); if(hit) return {why:'Exclusive with '+(Q(hit)?.n||hit)}; }
+  if(q.nx && (st.turned.has(q.nx)||st.log.has(q.nx))) return {why:'Later quest in this chain already taken'};
+  if(q.bc && (st.turned.has(q.bc)||st.log.has(q.bc))) return {why:'Breadcrumb target already taken'};
+  if(q.pa && !st.log.has(q.pa)) return {why:'Parent quest '+(Q(q.pa)?.n||q.pa)+' must be in your log'};
+  if(q.mx && st.level>q.mx) return {why:'Only available up to level '+q.mx};
+  const req=q.r>1?q.r:Math.max(1,(q.l||1)-6);
+  if(st.level<req) return {why:'Requires level '+req,level:req};
+  return null;
+}
+
+/* ---------- routes & simulation ---------- */
+const LS='frp.v1';
+let store={routes:[],cur:null};
+let route=null, cursor=-1, SIM=null, selQuest=null;
+function uid(){ return Math.random().toString(36).slice(2,9); }
+const CLS_COL={Druid:'#ff7c0a',Hunter:'#aad372',Mage:'#3fc7eb',Paladin:'#f48cba',Priest:'#ffffff',Rogue:'#fff468',Shaman:'#0070dd',Warlock:'#8788ee',Warrior:'#c69b6d'};
+function newRoute(base){
+  const r={id:uid(),name:'New route',char:{faction:'H',race:'Tauren',cls:'Druid',level:1,xp:0,party:1,rep:false,prof:false,event:false,dungeons:{}},steps:[],guides:[],guide:{group:'Forever Routes',next:'',extra:''},...(base||{})}; r.char.rcol=CLS_COL[r.char.cls]||r.char.rcol; r.ccol=1; return r;
+}
+let saveT=null;
+function save(){ store.cur=route.id; clearTimeout(saveT); saveT=setTimeout(saveNow,250); }
+function saveNow(){ store.savedAt=Date.now(); if(route) route.savedAt=store.savedAt;
+  for(const r of store.routes){ const used=new Set((r.steps||[]).filter(s=>s.src&&!s.src.auto).map(s=>s.src.g)); for(const g of r.guides||[]){ if(used.has(g.id)){ if(!g.raw&&rawCache.has(g.id)) g.raw=rawCache.get(g.id); } else if(g.raw){ if(!rawCache.has(g.id)) rawCache.set(g.id,g.raw); delete g.raw; } } }
+  const txt=JSON.stringify(store); let lsOK=false;
+  try{ localStorage.setItem(LS,txt); lsOK=true; }catch(e){ // too big for browser storage: keep a copy without the guide text (that also lives in the database); never delete the old copy
+    try{ localStorage.setItem(LS,JSON.stringify(store,(k,v)=>k==='raw'?undefined:v)); lsOK=true; }catch(_){ } }
+  for(const r of store.routes) if(r.savedAt) kvPut('route:'+r.id,JSON.stringify(r)); // each route also on its own, so one bad load can never wipe the others
+  kvPut('store',txt).then(ok=>{ const bad=!ok&&!lsOK; const b=document.getElementById('saveWarn'); if(b) b.hidden=!bad; }); }
+addEventListener('pagehide',()=>{ if(saveT){ clearTimeout(saveT); saveNow(); } });
+async function loadCatalog(){ try{ const c=JSON.parse(await kvGet('catalog')||'null'); if(Array.isArray(c)&&(!store.catalog||c.length>=store.catalog.length)) store.catalog=c; }catch(e){} }
+async function loadStore(){
+  let a=null,b=null; try{ a=JSON.parse(localStorage.getItem(LS)||'null'); }catch(e){} try{ b=JSON.parse(await kvGet('store')||'null'); }catch(e){}
+  const ok=s=>s&&Array.isArray(s.routes)&&s.routes.length; const s=ok(a)&&ok(b)?((b.savedAt||0)>=(a.savedAt||0)?b:a):(ok(b)?b:ok(a)?a:null); if(s) store=s;
+  // merge in every route saved on its own (newest copy of each wins; routes you deleted stay deleted)
+  try{ const del=new Set([...(a?.deleted||[]),...(b?.deleted||[]),...(store.deleted||[])]); store.deleted=[...del]; const byId=new Map();
+    for(const r of [...(a?.routes||[]),...(b?.routes||[])]) if(r&&r.id&&!del.has(r.id)&&(!byId.has(r.id)||(r.savedAt||0)>(byId.get(r.id).savedAt||0))) byId.set(r.id,r);
+    for(const k of (await kvKeys()).filter(k=>String(k).startsWith('route:'))){ let r=null; try{ r=JSON.parse(await kvGet(k)); }catch(e){} if(r&&r.id&&!del.has(r.id)&&(!byId.has(r.id)||(r.savedAt||0)>(byId.get(r.id).savedAt||0))) byId.set(r.id,r); }
+    const order=store.routes.map(r=>r.id); const merged=[...byId.values()].sort((x,y)=>{ const i=order.indexOf(x.id), j=order.indexOf(y.id); return (i<0?1e9:i)-(j<0?1e9:j); });
+    const full=merged.filter(r=>(r.steps||[]).length||(r.guides||[]).length), empty=merged.filter(r=>!full.includes(r)); if(merged.length) store.routes=[...full,...empty.slice(0,full.length?1:1)]; if(!store.routes.some(r=>r.id===store.cur)&&full[0]) store.cur=full[0].id; }catch(e){}
+  // daily backups of what was loaded (last 7 kept), restorable from Settings
+  if(s){ try{ const day=new Date().toISOString().slice(0,10); const keys=(await kvKeys()).filter(k=>String(k).startsWith('backup:')).sort(); if(!keys.includes('backup:'+day)) await kvPut('backup:'+day,JSON.stringify(s)); const db=await rawDB(); for(const k of keys.slice(0,Math.max(0,keys.length-7))) db.transaction('kv','readwrite').objectStore('kv').delete(k); }catch(e){} }
+  for(const r of store.routes) for(const g of r.guides||[]) if(g.raw) rawCache.set(g.id,g.raw);
+  if(!store.routes.length){ const r=newRoute({name:'Mulgore start'}); store.routes.push(r); store.cur=r.id; }
+  route=store.routes.find(r=>r.id===store.cur)||store.routes[0];
+  for(const r of store.routes) migrateRoute(r);
+  cursor=route.steps.length-1;
+}
+function reqFail(s,st){ if(!s.reqs) return '';
+  const nm=ids=>ids.map(id=>Q(id)?.n||('quest '+id)).join(' / ');
+  for(const r of s.reqs){ const ids=r.ids, on=ids.some(id=>st.log.has(id)), tin=ids.some(id=>st.turned.has(id)), comp=ids.some(id=>st.log.get(id)?.done);
+    switch(r.k){
+      case 'isonquest': if(!on) return 'only if you have '+nm(ids); break;
+      case 'isnotonquest': if(on) return 'only if you don\u2019t have '+nm(ids); break;
+      case 'isquestturnedin': if(!tin) return 'only after turning in '+nm(ids); break;
+      case 'isquestnotturnedin': if(ids.every(id=>st.turned.has(id))) return nm(ids)+' already turned in'; break;
+      case 'isquestcomplete': if(!comp) return 'only once '+nm(ids)+' is complete'; break;
+      case 'isquestnotcomplete': if(comp) return nm(ids)+' already complete'; break;
+      case 'isquestavailable': if(ids.every(id=>st.turned.has(id)||st.log.has(id))) return nm(ids)+' no longer available'; break; } }
+  return ''; }
+function ensureIds(r){ for(const s of r.steps||[]) if(!s.id) s.id=uid(); r.sections=r.sections||{}; }
+function migrateRoute(r){ ensureIds(r); if(r.char&&!r.ccol){ r.char.rcol=CLS_COL[r.char.cls]||r.char.rcol; r.ccol=1; } /* paths default to their class colour */ if(r.char&&+r.char.dqmult===3.5&&!r.char.dq25){ r.char.dqmult=2.5; } if(r.char) r.char.dq25=1; /* Forever nerfed dungeon quest XP from ×3.5 to ~×2.5 */ r.guides=r.guides||[];
+  const TM=META.taxiMig||{}; if(r.char&&Array.isArray(r.char.fps)) r.char.fps=r.char.fps.map(x=>META.taxi.nodes[x]?x:(TM[x]||x));
+  for(const st of r.steps||[]) if(st.node&&!META.taxi.nodes[st.node]&&TM[st.node]) st.node=TM[st.node];
+  if((r.notesMig||0)<2){ r.notesMig=2; for(const g of r.guides){ g.includeNotes=true; g.stopAtBlocked=false; } }
+  // RestedXP #optional used to be imported as the user's own opt flag
+  for(const g of r.guides) for(const gs of g.steps||[]) if(gs.opt){ gs.gopt=true; delete gs.opt; }
+  for(const st of r.steps||[]){ if(!st.src||st.src.auto||!st.opt) continue; const g=r.guides.find(x=>x.id===st.src.g); if(g&&g.steps&&g.steps[st.src.i]?.gopt){ st.gopt=true; delete st.opt; } }
+  return r; }
+function initState(r){ return {level:+r.char.level||1,xp:+r.char.xp||0,party:Math.max(1,+r.char.party||1),log:new Map(),turned:new Set(),fps:new Set(r.char.fps||[]),home:startHome(r),fq:new Map(),expl:startExpl(r)}; }
+function startExpl(r){ const s=new Set(); const h=START[r.char.race]; if(h&&META?.expl){ const p=zp2plane(...h); if(p){ const a=areaAt(p.X,p.Y); if(a) s.add(a); } } return s; }
+// a new character's hearthstone is bound to where they first spawn
+const START_NAME={Human:'Northshire Abbey',Dwarf:'Coldridge Valley',Gnome:'Coldridge Valley','Night Elf':'Shadowglen',Orc:'Valley of Trials',Troll:'Valley of Trials',Undead:'Deathknell',Tauren:'Camp Narache'};
+function startHome(r){ const s=START[r.char.race]; if(!s) return null; const p=zp2plane(...s); return p?{...p,label:START_NAME[r.char.race]||zoneName(s[0]),step:null,def:true}:null; }
+function cloneState(s){ return {level:s.level,xp:s.xp,party:s.party,log:new Map([...s.log].map(([k,v])=>[k,{...v,objs:v.objs?new Set(v.objs):undefined,stk:v.stk?new Set(v.stk):undefined}])),turned:new Set(s.turned),fps:new Set(s.fps),home:s.home,fq:new Map(s.fq||[]),fqs:s.fqs?new Map(s.fqs):undefined,money:s.money||0,lastTrain:s.lastTrain,stkT:s.stkT,fqo:new Map([...(s.fqo||new Map())].map(([k,v])=>[k,new Set(v)])),expl:new Set(s.expl||[])}; }
+// Forever: quest log holds 40, but escort quests can't be started with 25+ quests in the log
+const LOGMAX=40, ESC_LIMIT=25, ESCORT=new Set([155,219,309,435,648,660,665,667,731,836,863,898,938,945,976,994,995,1144,1222,1249,1270,1393,1440,1560,1651,2742,2767,2845,2904,2969,3382,3525,3982,4121,4245,4261,4265,4322,4491,4770,4901,4904,4966,5203,5321,5713,5821,5943,5944,6132,6403,6482,6523,6544,6641,8736]);
+const ESC_NOTE=`Escort quest: have fewer than ${ESC_LIMIT} quests in your log before accepting (Forever bug)`;
+function simulate(){ simulate0(); const by=route.steps.map((x,k)=>[x,k]).filter(([x])=>x.t==='grind'&&x.mode==='by'); if(!by.length) return;
+  for(let it=0;it<8;it++){ let ch=false; for(const [g,k] of by){ const j=route.steps.findIndex(x=>x.id===g.at); if(j<=k||SIM.res[k]?.inactive) continue; const a=SIM.res[j]?.after; if(!a) continue;
+      const diff=totalXP(Math.min(MAXLVL,g.level),g.xp||0)-totalXP(a.level,a.xp); const r=SIM.res[k]; const base=Math.max(+g._tgt||0,r.byNow||0); const nv=Math.max(r.byNow||0,Math.round(base+diff)); if(nv!==(+g._tgt||0)&&Math.abs(diff)>0){ g._tgt=nv; ch=true; } }
+    if(!ch) break; simulate0(); } }
+/* ---------- auto-grouping: consecutive objective steps in the same area are done together, on one loop ---------- */
+let GRP={lead:new Map(),mem:new Map()};
+const grpOn=()=>route.char.autoGrp!==false, grpYd=()=>+route.char.grpYd>0?+route.char.grpYd:250;
+function objArea(s,ref){ const obs=objectives(s.q).filter(o=>!o.pre&&(!s.obj||o.rx===s.obj)&&['kill','loot','obj'].includes(o.kind)); const pts=obs.flatMap(o=>o.pts).filter(p=>p&&!p.dg&&p.z!=null); if(!pts.length) return null;
+  const a=objPoint(s.q,s.obj,ref)||pts[0]; const near=pts.filter(p=>Math.hypot(p.X-a.X,p.Y-a.Y)<=400); const c={X:near.reduce((x,p)=>x+p.X,0)/near.length,Y:near.reduce((y,p)=>y+p.Y,0)/near.length,m:META.zones[a.z]?.m}; return {c,pts:near}; }
+function computeGroups(){ GRP={lead:new Map(),mem:new Map()}; if(!grpOn()) return; const R=grpYd(); let g=null, ref=null;
+  const ok=(x,i)=>x.t==='complete'&&x.q&&Q(x.q)&&!x.src&&!isSticky(x)&&!(x.upto>0)&&!x.pin&&!x.nogrp&&!SIM?.res?.[i]?.inactive;
+  route.steps.forEach((x,i)=>{ if(!ok(x,i)){ g=null; return; } const A=objArea(x,ref||(SIM?.res?routeRefBefore(i):null)); if(!A){ g=null; return; } ref=A.c;
+    const ed=x.path&&x.pathSrc==='edited'; if(g&&!ed&&A.c.m===g.c.m&&Math.hypot(A.c.X-g.c.X,A.c.Y-g.c.Y)<=R){ g.mem.push(i); g.pts.push(...A.pts); GRP.mem.set(i,g.lead); return; }
+    g={lead:i,mem:[],pts:[...A.pts],c:A.c,own:!!ed}; GRP.lead.set(i,g); });
+  for(const [i,g] of GRP.lead){ if(!g.mem.length){ GRP.lead.delete(i); continue; } if(!g.own) g.path=genPath(null,{pts:g.pts},null); } }
+function simulate0(){ computeGroups(); ensureIds(route);
+  const st=initState(route); const res=[]; let atCursor=cloneState(st); const optQ=new Set(route.optOff?route.steps.filter(x=>x.opt&&x.t==='accept'&&x.q).map(x=>x.q):[]);
+  let lastPt=null; const rqC=new Map();
+  // a sticky "complete" followed later by a normal one for the same quest/objective is a passive attempt: the later step is where it's counted
+  const passive=new Map(); { const lastAcc=new Map(); for(let k=route.steps.length-1;k>=0;k--){ const x=route.steps[k]; if((x.t!=='accept'&&x.t!=='turnin')||!x.q) continue; const kk=x.t+':'+x.q; if(isSticky(x)){ if(lastAcc.has(kk)) passive.set(k,lastAcc.get(kk)); } else lastAcc.set(kk,k); } }
+  { const lastFinal=new Map(); for(let k=route.steps.length-1;k>=0;k--){ const x=route.steps[k]; if(x.t!=='complete'||!x.q) continue; const key=x.q+':'+(x.obj||0), keyQ=x.q+':0';
+      if(isSticky(x)){ const f=lastFinal.get(key)??lastFinal.get(keyQ); if(f!=null) passive.set(k,f); } else { lastFinal.set(key,k); if(x.obj) { if(!lastFinal.has(keyQ)) {} } else { for(const kk of [...lastFinal.keys()]) if(kk.startsWith(x.q+':')) lastFinal.set(kk,k); } } } }
+  route.steps.forEach((s,i)=>{
+    const r={i,err:[],warn:[],gained:0,before:{level:st.level,xp:st.xp}};
+    const q=s.q?Q(s.q):null;
+    let skip=stepActive(s,st);
+    if(!skip && s.reqs){ const key=(s.src?.g||'')+':'+(s.rx||i); let w; if(s.rx&&rqC.has(key)) w=rqC.get(key); else { w=reqFail(s,st); rqC.set(key,w); } if(w) skip='Guide skips this: '+w; }
+    if(!skip && s.src && !s.src.auto && q && ((s.t==='accept'&&(st.log.has(s.q)||st.turned.has(s.q)))||((s.t==='turnin'||s.t==='complete')&&st.turned.has(s.q)))) skip='Already done earlier in the route (the guide lists it more than once)';
+    if(!skip && s.gopt && q){ // RestedXP #optional: only shown when it applies
+      const L=st.log.get(s.q);
+      if(s.t==='accept' && (L||st.turned.has(s.q)||whyUnavailable(s.q,st,route))) skip='Guide-optional: quest not available here, skipped';
+      else if(s.t==='complete' && (!L||L.done)) skip='Guide-optional: '+(L?'already complete':'quest not in your log')+', skipped';
+      else if(s.t==='turnin' && (!L||!L.done)) skip='Guide-optional: '+(L?'objectives not done':'quest not in your log')+', skipped';
+    }
+    if(!skip && route.hideOpt!==false && route.optOff){ if(s.opt) skip='Optional step, not counted'; else if(s.q&&optQ.has(s.q)&&s.t!=='accept') skip='Part of an optional quest, not counted'; }
+    if(!skip && route.optOff && s.opt && s.t==='accept') optQ.add(s.q);
+    if(!skip&&passive.has(i)){ r.passive=passive.get(i); }
+    if(skip){ r.inactive=skip; }
+    else if(r.passive!=null){ r.warn.push(`Done along the way if you can: counted at step ${r.passive+1}, where it has to be finished`); }
+    else if(s.t==='turnin'&&s.q&&isSticky(s)&&!stepGuide(s)){ /* your own 'if you can' hand-in; guide #sticky turn-ins are real hand-ins */ r.warn.push('Sticky hand-in: no XP and the quest stays in your log until a normal turn-in step. Use “Turn in now…” to add one.'); st.stkT=new Map(st.stkT||[]); st.stkT.set(s.q,i); }
+    else if((s.t==='accept'||s.t==='complete'||s.t==='turnin'||s.t==='abandon') && !q){ // Forever quest Questie doesn't know yet: kept as written, tracked like a custom quest
+      const xpSet=+(route.qxp?.[s.q])||0, xp=xpSet||fqXpEst(s.q); r.custom=true; if(!st.fq) st.fq=new Map(); if(s.t==='accept'&&!st.fq.has(s.q)) st.fq.set(s.q,'log'); else if(s.t==='complete'&&st.fq.get(s.q)==='log'){ const ob=Object.keys(foreverQuests().get(s.q)?.objs||{}).length; if(s.obj&&ob>1){ st.fqo=st.fqo||new Map(); const set=new Set(st.fqo.get(s.q)||[]); set.add(s.obj); st.fqo.set(s.q,set); if(set.size>=ob) st.fq.set(s.q,'ready'); } else st.fq.set(s.q,'ready');
+        st.fqs=new Map(st.fqs||[]); const ss=new Set(st.fqs.get(s.q)||[]); const key=s.obj&&ob>1?s.obj:'*'; if(isSticky(s)) ss.add(key); else if(key==='*') ss.clear(); else ss.delete(key); st.fqs.set(s.q,ss); }
+      else if(s.t==='complete'&&st.fq.get(s.q)==='ready'&&!isSticky(s)&&st.fqs?.get(s.q)?.size){ st.fqs=new Map(st.fqs); const ss=new Set(st.fqs.get(s.q)); if(s.obj) ss.delete(s.obj); else ss.clear(); st.fqs.set(s.q,ss); } else if(s.t==='turnin') st.fq.set(s.q,'done'); else if(s.t==='abandon') st.fq.delete(s.q);
+      if(s.t==='turnin'&&xp){ r.gained=xp; addXP(st,xp); }
+      { const fe=foreverQuests().get(s.q); const known=!!(fe?.qb); const msg=s.t==='turnin'?(xpSet?`Forever quest: counting ${fmt(xp)} XP (set by you).`:xp?`Forever quest: Questie has no XP for it yet. Counting ≈${fmt(xp)} XP, estimated from its quest level: set it if you know it.`:'Forever quest with no XP data: set its XP reward if you know it.'):known?null:`Forever quest Questie doesn't know yet${s.src?': kept exactly as the guide has it.':' (taken from your imported guides).'}`; if(msg) r.warn.push(msg); } }
+    else if(s.t==='accept'){
+      const w=whyUnavailable(s.q,st,route); if(w) r.err.push(w.why); r.lvAt=st.level;
+      if(st.log.size>=LOGMAX) r.err.push(`Quest log is full (${LOGMAX})`); else if(ESCORT.has(s.q)&&st.log.size>=ESC_LIMIT) r.err.push(`Escort quest: you have ${st.log.size} quests in your log; drop below ${ESC_LIMIT} before accepting`);
+      st.log.set(s.q,{done:!hasObjectives(s.q)});
+    } else if(s.t==='complete'){
+      if(!st.log.has(s.q)) r.err.push('Not in your quest log yet'); else { const e=st.log.get(s.q); e.objs=e.objs||new Set(); e.stickyDone=isSticky(s); const stkBefore=new Set(e.objs);
+        if(s.obj){ if(e.objs.has(s.obj)||e.done) r.warn.push('This objective is already done'); e.prog=e.prog||{}; const had=e.prog[s.obj]||0; const tot=+(s.counts?.[s.obj])||0;
+          if(s.upto>0){ // partial: only up to this count now, the rest later (RestedXP .complete q,n,N)
+            const n=Math.max(0,s.upto-had); if(!n) r.warn.push(`Already at ${had} for this objective`); const ke=n?killEstimate(s.q,{[s.obj]:n},st,i=>i!==s.obj):null; e.prog[s.obj]=Math.max(had,s.upto); if(ke&&ke.xp){ r.kill=ke; r.gained=ke.xp; addXP(st,ke.xp); } }
+          else { const cnt=had?{[s.obj]:Math.max(1,(tot||killCfg().def)-had)}:s.counts; const ke=killEstimate(s.q,cnt,st,i=>i!==s.obj); e.objs.add(s.obj); if(ke.xp){ r.kill=ke; r.gained=ke.xp; addXP(st,ke.xp); } if(objNums(s.q).every(n=>e.objs.has(n))) e.done=true; } }
+        else { const ke=killEstimate(s.q,s.counts,st,i=>e.objs.has(i)); e.done=true; objNums(s.q).forEach(n=>e.objs.add(n)); if(ke.xp){ r.kill=ke; r.gained=ke.xp; addXP(st,ke.xp); } }
+        e.stk=new Set(e.stk||[]); if(isSticky(s)){ for(const n of e.objs) if(!stkBefore.has(n)) e.stk.add(n); } else { if(s.obj&&!(s.upto>0)) e.stk.delete(s.obj); else if(!s.obj) e.stk.clear(); } }
+    } else if(s.t==='turnin'){
+      if(!st.log.has(s.q)){ if(q.fv&&s.src) r.warn.push('Forever quest the guide hands in without an accept step in your route (it may be picked up automatically, e.g. an escort): counted anyway'); else r.err.push('Not in your quest log'); }
+      else if(!st.log.get(s.q).done){ const e=st.log.get(s.q); const miss=objectives(s.q).filter(o=>o.rx&&!(e.objs&&e.objs.has(o.rx))).map(o=>o.text); r.err.push('Objectives not done'+(miss.length?': '+miss.join('; '):'')); }
+      const xp=questXP(s.q,st.level); r.gained=xp; if(q.xe&&s.xpo==null) r.warn.push(`Forever quest: Questie has no XP for it yet, ≈${fmt(xp)} estimated from its level. Set the real value with ✎ if you know it.`); if(st.stkT?.has(s.q)){ st.stkT=new Map(st.stkT); st.stkT.delete(s.q); }
+      if(q.xp&&st.level<MAXLVL&&st.level>q.xp[0]+5){ const full=questXP(s.q,q.xp[0]); r.pen={lvl:st.level,ql:q.xp[0],xp,full}; r.warn.push(`XP penalty: you are level ${st.level}, the quest is level ${q.xp[0]}, so it gives ${Math.round(Math.max(1,Math.min(10,2*(q.xp[0]-st.level)+20))*10)}% (${fmt(xp)} of ${fmt(full)} XP, losing ${fmt(full-xp)}). Turn it in by level ${q.xp[0]+5} for full XP.`); }
+      addXP(st,xp); st.log.delete(s.q); st.turned.add(s.q);
+    } else if(s.t==='abandon'){ st.log.delete(s.q); }
+    else if(s.t==='grind'){
+      if(s.mode==='to'){
+        const target=totalXP(s.level,s.xp||0), now=totalXP(st.level,st.xp);
+        if(target<=now){ r.warn.push('Already past this point'); }
+        else { r.gained=target-now; st.level=Math.min(MAXLVL,s.level); st.xp=st.level>=MAXLVL?0:(s.xp||0); }
+      } else if(s.mode==='by'){ const j=route.steps.findIndex(x=>x.id===s.at); const now=totalXP(st.level,st.xp); const T=+s._tgt||0; r.byNow=now;
+        if(T>now){ r.gained=T-now; const t=fromTotal(T); st.level=t.level; st.xp=t.xp; } else if(T) r.warn.push('Already past the target here: no grinding needed');
+        if(j<0) r.err.push('The step to ding at is no longer in the route: edit this grind step'); else if(j<=i) r.err.push(`Step ${j+1} comes before this grind: pick a later step`); else if(T){ const t=fromTotal(T); r.warn.push(`Grind to level ${t.level} + ${fmt(t.xp)} XP, so you are level ${s.level}${s.xp?' + '+fmt(s.xp)+' XP':''} after step ${j+1}`); }
+      } else { r.gained=+s.amount||0; addXP(st,r.gained); }
+    } else if(s.t==='party'){ if(s.size===st.party) r.warn.push('Group size is already '+s.size); st.party=s.size;
+    } else if(s.t==='custom'){
+      if(s.act==='turnin'){ r.gained=+s.xp||0; addXP(st,r.gained); }
+    }
+    if(s.xpo!=null&&!r.inactive){ r.xpCalc=r.gained; st.level=r.before.level; st.xp=r.before.xp; r.gained=+s.xpo; addXP(st,r.gained); }
+    r.after={level:st.level,xp:st.xp}; r.logSize=st.log.size; r.party=st.party;
+    if(r.inactive) r.pt=null; else if(!travelGeo(s,r,st,lastPt)) r.pt=stepPoint(s,lastPt);
+    if(!r.inactive&&s.t==='deathskip'&&r.pt){ const G=gyAt(s.gy); const D=deathSpot(lastPt,G); if(D){ r.dep=withZone(D); r.leg={type:'death'}; } }
+    const gm=GRP.mem.get(i), gl=GRP.lead.get(i); if(gm!=null&&res[gm]?.pt&&!r.inactive){ r.pt=res[gm].pt; r.grpOf=gm; } if(gl) r.grpN=gl.mem.length+1;
+    if(!r.inactive){ const P=gm!=null?null:gl&&!gl.own&&gl.path?gl.path:pathOf(s); if(P&&P.length>=2){ r.path=pathPts(P); if(r.path.length) r.pt=Object.assign({},r.pt||{},r.path[0]); } }
+    { const lt=r.leg?.type; const until=+route.char.ypkUntil||40; const tgt=lt==='hs'?null:(lt==='fly'||lt==='ride'||lt==='death')?r.dep:r.pt;
+      let pj=i-1; while(pj>=0&&res[pj]?.inactive) pj--; const afterGrind=pj>=0&&route.steps[pj].t==='grind'; /* you've just been grinding: no extra travel kills on the next leg */
+      const own=s.ypk!=null&&s.ypk!==''; const yp=own?+s.ypk:+route.char.ypk; if(own&&!(yp>0)) r.walkOff=true;
+      const toObj=s.t==='complete'; /* travel kills only on the way to an objective: not on accept / turn-in / travel legs, never on the objective's own loop */
+      if((own||!afterGrind&&toObj)&&!r.inactive&&tgt&&lastPt&&!isSticky(s)&&gm==null&&yp>0&&st.level<until&&st.level<MAXLVL){ const w=travelKills(lastPt,tgt,st,yp); if(w){ r.walk=w; r.gained+=w.xp; addXP(st,w.xp); r.after={level:st.level,xp:st.xp}; } } }
+    if(!r.inactive){ const lt=r.leg?.type; const pts=[]; if(lastPt&&!isSticky(s)&&gm==null){ if(lt==='fly'||lt==='ride'||lt==='death'){ if(r.dep) pts.push(lastPt,r.dep,null); } else if(lt!=='hs'&&r.pt) pts.push(lastPt,r.pt); }
+      if(r.path&&r.path.length>1&&!isSticky(s)) pts.push(null,...r.path,r.path[0]); /* sticky / done-along-the-way steps don't walk their loop */ if(r.pt&&(lt==='fly'||lt==='ride'||lt==='hs'||lt==='death')) pts.push(null,r.pt); exploreAlong(pts,st,r); }
+    if(!r.inactive&&r.passive==null){ let m=0; const L=r.before?.level||st.level;
+      if(r.kill?.money) m+=r.kill.money; if(r.walk?.kills) m+=r.walk.kills*lvlMoney(r.walk.lv||L)/(st.party||1);
+      if(s.t==='grind'&&r.gained>0&&(!s.src||s.src==='mobs'||s.src==='both')){ const g=Math.max(1,L-2); const per=mobXP(L,g,false,st.party||1)||1; m+=r.gained/per*lvlMoney(g)/(st.party||1); }
+      if(s.t==='turnin'&&s.q&&Q(s.q)&&!(isSticky(s)&&!stepGuide(s))) m+=questMoney(s.q)+questItemMoney(s.q);
+      if(s.t==='buy') for(const it of s.items||[]) m-=(META.money?.buy?.[it.id]||0)*(+it.c||1);
+      if(s.t==='prof'&&s.act==='learn') m-=1000; /* apprentice profession: 10s */
+      if(s.t==='train'&&s.npc){ const T=trainerSpells(s.npc)||[]; const since=st.lastTrain??0; m-=T.filter(x=>x[0]<=L&&x[0]>since).reduce((a,x)=>a+x[3],0); st.lastTrain=L; }
+      r.money=m; st.money=(st.money||0)+m; }
+    r.from=lastPt; r.stk=(isSticky(s)||gm!=null)&&!['hs','fly','ride','death'].includes(r.leg?.type); /* a hearth / flight still moves you even when the guide shows it as #completewith */ if(r.pt&&!r.stk) lastPt=r.pt;
+    res.push(r);
+    if(i===cursor) atCursor=cloneState(st);
+  });
+  if(cursor<0) atCursor=initState(route);
+  estimateTimes(res);
+  SIM={res,st:atCursor,end:{level:st.level,xp:st.xp,log:st.log.size,t:res.length?res[res.length-1].tAt:0,money:st.money||0}};
+  SIM.avail=computeAvailable(SIM.st);
+  SIM.near=nearZones();
+}
+function nearest(pts,ref){
+  pts=pts.filter(p=>!p.dg).length?pts.filter(p=>!p.dg):pts;
+  if(!pts.length) return null; if(!ref) return pts[0];
+  let b=pts[0],bd=1e18; for(const p of pts){ const d=(p.X-ref.X)**2+(p.Y-ref.Y)**2; if(d<bd){bd=d;b=p;} } return b;
+}
+/* ---------- Forever quests known only from your imported guides ---------- */
+function drawFQ(){ const s=view.s, st=SIM.st;
+  if(layers.avail&&s>=0.015) for(const a of fqAvail(st,true)){ if(a.lock.length&&!layers.locked) continue; const e=a.e;
+    const obl=Object.values(e.objs||{}), dn=st.fqo?.get(e.q)||new Set(); const sk=st.fqs?.get(e.q)||new Set(); const open=a.f==='log'||(a.f==='ready'&&sk.size); const marks=!a.f?[[e.acc[0],'!',1]]:[[e.tin[0],'?',a.f==='ready'?1:.6],...(open?(obl.length>1?obl.filter(o=>o.loc&&(!dn.has(o.n)||sk.has(o.n)||sk.has('*'))).map(o=>[o.loc,'◆',dn.has(o.n)?.5:1,o.text]):e.cmp.length&&(a.f==='log'||sk.has('*'))?[[e.cmp[0],'◆',a.f==='ready'?.5:1]]:[]):[])];
+    for(const [l,ch,al,otx] of marks){ if(!l) continue; const p=zp2plane(l.z,l.px,l.py); if(!p) continue; const [x,y]=toS(p); if(x<-12||x>W+12||y<-12||y>H+12) continue;
+    const soon=!a.f&&st.level<e.minL; ctx.globalAlpha=soon?.55:al; ctx.fillStyle='#07363a'; ctx.beginPath(); ctx.arc(x,y,10,0,7); ctx.fill(); ctx.strokeStyle='#4fe3d0'; ctx.lineWidth=2; ctx.stroke();
+    ctx.font='900 14px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillStyle='#4fe3d0'; ctx.fillText(ch,x,y+.5); ctx.globalAlpha=1;
+    if(s>0.08) haloText(e.n,x,y-17,'11px "Alegreya Sans", sans-serif','#bff7ef','rgba(4,30,32,.9)',3);
+    hits.push({x,y,r:11,kind:'fq',q:e.q,label:e.n+(soon?` (from level ${e.minL})`:ch==='?'?' · turn in':ch==='◆'?' · '+(otx||'objective'):'')}); } } }
+
+const FQ={key:null,map:new Map()};
+function guideLevels(g){ const m=(g.name||'').match(/(\d+)\s*-\s*(\d+)/); return m?[+m[1],+m[2]]:[1,60]; }
+function foreverQuests(){ const key=route.id+':'+(route.guides||[]).map(g=>g.id+'/'+g.steps.length).join(','); if(FQ.key===key) return FQ.map; const m=new Map();
+  for(const g of route.guides||[]){ const [l0,l1]=guideLevels(g); for(const x of g.steps||[]){ if(!x.q||Q(x.q)||!x.cond||!['accept','turnin','complete'].includes(x.t)) continue;
+    let e=m.get(x.q); if(!e) m.set(x.q,e={q:x.q,n:null,acc:[],tin:[],cmp:[],g:g.name,l:l0,l1,tgtA:null,tgtT:null,cl:null});
+    if(x.qn&&!e.n) e.n=x.qn; const L=x.loc&&x.loc.z!=null?{z:x.loc.z,px:+x.loc.px,py:+x.loc.py}:null;
+    if(x.t==='accept'){ if(L) e.acc.push(L); if(!e.tgtA) e.tgtA=x.tgt||null; } else if(x.t==='turnin'){ if(L) e.tin.push(L); if(!e.tgtT) e.tgtT=x.tgt||null; } else { if(L) e.cmp.push(L); if(!e.cl&&x.cl?.length) e.cl=x.cl; e.objs=e.objs||{}; for(const o of x.objs||[]) if(!e.objs[o.n]) e.objs[o.n]=o; } } }
+  // guides sometimes copy an objective's .goto from another starting zone (e.g. The Great Outdoors in the undead guide points at Durotar's campfire): keep objectives on the quest giver's continent, else use the giver's spot
+  const cont=l=>META.zones[l.z]?.m; for(const e of m.values()){ const home=e.tin[0]||e.acc[0]; if(!home) continue; const hc=cont(home); const fix=l=>l&&cont(l)!==hc?{...home,moved:true}:l;
+    e.cmp=e.cmp.map(fix); for(const k in e.objs||{}){ const o=e.objs[k]; if(o.loc&&cont(o.loc)!==hc) e.objs[k]={...o,loc:{...home},moved:true}; } }
+  // Questie's Forever base data (QuestieDB): levels, races/classes, quest givers/enders; adds Forever quests your guides don't have
+  const B=META.fqb||{}; const locs=(ns,os)=>[...ns.flatMap(i=>entPts('n',i)),...os.flatMap(i=>entPts('o',i))].filter(p=>p.z!=null).map(p=>({z:p.z,px:+p.px,py:+p.py}));
+  const nm=(ns,os)=>ns.length?entName('n',ns[0]):os.length?entName('o',os[0]):null;
+  const applyB=(e,b)=>{ e.qb=b; if(b[1]) e.lv=b[1]; if(b[2]) e.req=b[2]; if(b[0]&&(!e.n||e.n==='Quest '+e.q||e.qie)) e.n=b[0]; e.ra=b[3]; e.cls=b[4]; e.sort=b[10]; if(b[9]) e.txt=b[9];
+    if(!e.acc.length) e.acc=locs(b[5],b[6]); if(!e.tin.length) e.tin=locs(b[7],b[8]); if(!e.tgtA&&b[5].length) e.tgtA=nm(b[5],[]); if(!e.tgtT&&b[7].length) e.tgtT=nm(b[7],[]); };
+  for(const e of m.values()) if(B[e.q]) applyB(e,B[e.q]);
+  for(const k in B){ const q=+k; if(m.has(q)||Q(q)) continue; const b=B[k]; if(b[3]===-1) continue; const e={q,n:b[0],acc:[],tin:[],cmp:[],g:'Questie (Forever)',qie:1,l:b[2]||Math.max(1,(b[1]||1)-4),l1:b[1],tgtA:null,tgtT:null,cl:null}; applyB(e,b); if(!e.acc.length) continue; m.set(q,e); }
+  for(const e of m.values()){ if(!e.n) e.n='Quest '+e.q; e.minL=e.req||Math.max(1,Math.min(e.l,e.lv?e.lv-4:e.l)); } FQ.key=key; FQ.map=m; return m; }
+function fqBlocked(e,ci){ ci=ci||charInfo(route);
+  if(e.ra){ if(e.ra===-1) return 'not for the classic races (Skyborne)'; if(ci.rb&&!(e.ra&ci.rb)) return 'not available to your race'; if(!ci.rb&&(e.ra&FMASK[ci.fac])!==FMASK[ci.fac]) return 'restricted to specific races'; }
+  if(e.cls&&!(e.cls&ci.cb)) return 'class quest for another class'; if(e.sort<0&&CLASS_SORT_NAME[e.sort]&&CLASS_SORT_NAME[e.sort]!==route.char.cls) return 'class quest for another class';
+  if(e.qb){ for(const n of e.qb[5]){ const fr=DB.n[n]?.fr; if(fr&&!fr.includes(ci.fac)) return 'quest giver is hostile to your faction'; } if(e.sort<0&&PROF_SORTS.has(e.sort)&&!ci.opts.prof) return 'profession quest (enable in Settings)'; if(e.sort<0&&EVENT_SORTS.has(e.sort)&&!ci.opts.event) return 'event quest (enable in Settings)'; }
+  return null; }
+let xpMed=null; function fqXpEst(q){ const e=foreverQuests().get(q)||{}; if(!e.lv) return 0; if(!xpMed){ xpMed={}; const by={}; for(const k in DB.q){ const x=DB.q[k].xp; if(x&&x[1]) (by[x[0]]=by[x[0]]||[]).push(x[1]); } for(const L in by){ const a=by[L].sort((a,b)=>a-b); xpMed[L]=a[a.length>>1]; } } return xpMed[e.lv]||0; }
+function fqPrevMissing(e,st){ const miss=[]; for(const p of e.prev||[]){ if(Q(p)){ if(!st.turned.has(p)) miss.push(Q(p).n); } else if(foreverQuests().has(p)||META.fqb?.[p]){ if(fqStatus(p,st)!=='done') miss.push(foreverQuests().get(p)?.n||META.fqb?.[p]?.[4]||('Quest '+p)); } } return miss; }
+function fqHidden(st){ const out=[]; const at=q=>{ let a=-1,d=-1; route.steps.forEach((x,i)=>{ if(x.q!==q||i>cursor||SIM.res[i]?.inactive) return; if(x.t==='accept'&&a<0) a=i; if(x.t==='turnin') d=i; }); return {a,d}; };
+  const ci=charInfo(route); for(const e of foreverQuests().values()){ const f=fqStatus(e.q,st); let why=null; const w=at(e.q); if(!f&&e.qie&&fqBlocked(e,ci)) continue; if(!f&&!e.qie&&fqBlocked(e,ci)) why=fqBlocked(e,ci); else
+    if(f==='done') why=`turned in at step ${w.d+1}`; else if(!f&&!e.acc.length) why='the guide has no pick-up location for it'; else if(!f&&st.level<e.minL-3) why=`shown from level ${Math.max(1,e.minL-3)} (${e.qie?'Questie: quest level '+(e.lv||'?'):'guide '+e.g+' starts at '+e.l})`;
+    if(why) out.push({e,why}); } return out; }
+function fqStatus(q,st){ return (st||SIM.st).fq?.get(q)||null; }
+function fqAvail(st,soon){ const out=[]; const ci=charInfo(route); for(const e of foreverQuests().values()){ const f=fqStatus(e.q,st); if(f==='done') continue; if(!f&&fqBlocked(e,ci)) continue; if(!f&&!e.acc.length) continue; if(!f&&st.level<e.minL-(soon?3:0)) continue; const lock=f?[]:fqPrevMissing(e,st); out.push({e,f,lock}); } return out; }
+function fqStep(t,q,n){ const e=foreverQuests().get(+q); if(!e) return null;
+  if(t==='complete'&&n&&e.objs?.[n]){ const o=e.objs[n]; const s={t,q:e.q,qn:e.n,obj:+n,objText:o.text,cl:[...o.lines]}; if(o.loc) s.loc={...o.loc}; if(o.tgt) s.tgt=o.tgt; return s; } const loc=(t==='accept'?e.acc:t==='turnin'?e.tin:e.cmp)[0]||e.acc[0]||null; const s={t,q:e.q,qn:e.n}; if(loc) s.loc={...loc}; const tg=t==='accept'?e.tgtA:t==='turnin'?e.tgtT:null; if(tg) s.tgt=tg; if(t==='complete'&&e.cl) s.cl=[...e.cl]; return s; }
+function fqObjBtns(e,st){ st=st||SIM.st; const ob=Object.values(e.objs||{}); const sk=st.fqs?.get(e.q)||new Set(); const nowT='title="Sticky so far: adds a normal complete step here, the sticky one becomes \'if you can on the way\'"';
+  if(ob.length<2) return sk.has('*')?`<button class="btn sm gold" data-fqa="complete:${e.q}::now" ${nowT}>Complete now</button>`:`<button class="btn sm" data-fqa="complete:${e.q}">Complete</button>`; const done=st.fqo?.get(e.q)||new Set();
+  return ob.map(o=>sk.has(o.n)||sk.has('*')?`<button class="btn sm gold" data-fqa="complete:${e.q}:${o.n}:now" ${nowT}>Complete now: ${esc(o.text)}</button>`:`<button class="btn sm" data-fqa="complete:${e.q}:${o.n}" ${done.has(o.n)?'title="Already done at an earlier step: adds another complete step"':''}>${done.has(o.n)?'✓ ':''}${esc(o.text)}</button>`).join(''); }
+function fqRow(a){ const e=a.e; const xp=+(route.qxp?.[e.q])||0, est=xp?0:fqXpEst(e.q); const nx=(e.next||[]).map(n=>foreverQuests().get(n)?.n||META.fqb?.[n]?.[0]||Q(n)?.n).filter(Boolean); return `<div class="qrow" data-fq="${e.q}"><span class="lv">${e.lv||e.l}</span><span class="nm"><span>${a.lock.length?'🔒 ':''}${esc(e.n)}</span><br><span class="meta">${esc(e.g)} · ${a.f==='log'?'in your log':a.f==='ready'?'ready to turn in':SIM.st.level<e.minL?'from level '+e.minL:'Forever quest'}${xp?' · +'+fmt(xp)+' XP':est?' · ≈'+fmt(est)+' XP (est.)':''}${e.req?' · needs level '+e.req:''}${a.lock.length?' · Needs: '+esc(a.lock.join(', ')):''}${nx.length?' · leads to '+esc(nx.join(', ')):''}</span></span><span class="row" style="gap:3px">${a.f?'':`<button class="btn sm" data-fqa="accept:${e.q}">Accept</button>`}${a.f==='log'?accNowBtn(e.q,true):''}${a.f==='log'||a.f==='ready'?fqObjBtns(e):''}${a.f?`<button class="btn sm" data-fqa="turnin:${e.q}">Turn in</button>`:''}</span></div>`; }
+/* ---------- vendors ---------- */
+function vendorOf(id){ const v=META.vend?.[id]; return v?{id:+id,name:v[0],sub:v[1],fac:v[2],sp:v[3],items:v[4]}:null; }
+function vendorOK(v){ const f=charInfo(route).fac; return !v.fac||v.fac.includes(f); }
+function vendorPts(v){ return v.sp.map(([z,x,y])=>{ const p=zp2plane(z,x,y); return p?{...p,label:v.name,npc:v.id}:null; }).filter(Boolean); }
+/* ---------- graveyards / deathskip ---------- */
+let GYP=null; function gyPts(){ if(!GYP) GYP=(META.gy||[]).map(([z,x,y],i)=>{ const p=zp2plane(z,x,y); return p?{...p,gi:i,m:META.zones[z]?.m,label:'Spirit Healer · '+zoneName(z)}:null; }).filter(Boolean); return GYP; }
+function gyAt(i){ return gyPts().find(g=>g.gi===i)||null; }
+function nearestGY(p,m){ let b=null,bd=1e18; for(const g of gyPts()){ if(m!=null&&g.m!==m) continue; const d=Math.hypot(g.X-p.X,g.Y-p.Y); if(d<bd){bd=d;b=g;} } return b; }
+const DS_MARGIN=0.8; // die where the target graveyard is clearly the closest one (at most 80% of the distance to any other)
+function deathOK(D,G){ const dg=Math.hypot(D.X-G.X,D.Y-G.Y); for(const o of gyPts()){ if(o===G||o.m!==G.m) continue; if(dg>DS_MARGIN*Math.hypot(D.X-o.X,D.Y-o.Y)) return false; } return true; }
+function deathSpot(P,G){ if(!P||!G) return null; if(deathOK(P,G)) return {X:P.X,Y:P.Y};
+  let best=null,bd=1e18; const dx=G.X-P.X, dy=G.Y-P.Y, L=Math.hypot(dx,dy)||1, nx=-dy/L, ny=dx/L;
+  for(let t=0.02;t<=1.0001;t+=0.02) for(const o of [0,-0.15,0.15,-0.3,0.3]){ const D={X:P.X+dx*t+nx*o*L*t,Y:P.Y+dy*t+ny*o*L*t}; const d=Math.hypot(D.X-P.X,D.Y-P.Y); if(d<bd&&deathOK(D,G)){ bd=d; best=D; } }
+  return best||{X:G.X,Y:G.Y}; }
+function withZone(D){ const z=plane2zone(D.X,D.Y); return z?{...D,z:z.z,px:z.px,py:z.py}:D; }
+function addDeath(gi){ const G=gi!=null?gyAt(gi):null; let g=G;
+  if(!g){ const nx=SIM.res[cursor+1]?.pt; if(nx) g=nearestGY(nx,META.zones[nx.z]?.m); }
+  if(!g) return toast('Pick a graveyard: zoom in, click a ✝ Spirit Healer and choose “Die and res here”',4500);
+  addStep({t:'deathskip',gy:g.gi}); if(gi==null) toast(`Die and res at the ${zoneName(g.z)} graveyard, the closest one to your next step. Pick another ✝ on the map to change it.`,5000); }
+/* ---------- profession trainers ---------- */
+const PSPELL={Alchemy:2259,Blacksmithing:2018,Cooking:2550,Enchanting:7411,Engineering:4036,'First Aid':3273,Fishing:7620,Herbalism:2366,Leatherworking:2108,Mining:2575,Skinning:8613,Tailoring:3908};
+function ptrainerOf(id){ const v=META.ptrn?.[id]; return v?{id:+id,name:v[0],prof:v[1],fac:v[2],sp:v[3],sub:v[4]}:null; }
+function ptrainerPts(t){ return t.sp.map(([z,x,y])=>{ const p=zp2plane(z,x,y); return p?{...p,label:t.name,npc:t.id}:null; }).filter(Boolean); }
+function itemIdByName(n){ const k=n.trim().toLowerCase(); for(const src of [META.vi||{},DB.i||{}]) for(const id in src){ const nm=typeof src[id]==='string'?src[id]:src[id]?.n; if(nm&&nm.toLowerCase()===k) return +id; } return null; }
+async function addProf(id,act){ const t=ptrainerOf(id); if(!t) return;
+  if(act==='craft'){ const v=await askText(`What will you craft? e.g. "Linen Bandage x10"`,'','Add','text'); if(!v) return; const m=v.match(/^(.*?)(?:\s*[x×]\s*(\d+))?\s*$/i); const item=m[1].trim(); if(!item) return; addStep({t:'prof',act:'craft',prof:t.prof,item,n:+(m[2]||1),itemId:itemIdByName(item)}); return; }
+  addStep({t:'prof',act,prof:t.prof,npc:t.id,npcName:t.name}); }
+function trainerOf(id){ const v=META.trn?.[id]; return v?{id:+id,name:v[0],cls:v[1],fac:v[2],sp:v[3]}:null; }
+function myTrainers(){ const c=route.char.cls; return Object.keys(META.trn||{}).map(trainerOf).filter(t=>t.cls===c&&vendorOK(t)); }
+function trainerPts(t){ return t.sp.map(([z,x,y])=>{ const p=zp2plane(z,x,y); return p?{...p,label:t.name,npc:t.id}:null; }).filter(Boolean); }
+function nearestTrainer(ref){ let best=null,bd=1e18; for(const t of myTrainers()) for(const p of trainerPts(t)){ const d=ref?Math.hypot(p.X-ref.X,p.Y-ref.Y):0; if(d<bd){bd=d;best=t;} } return best; }
+function itemName(id){ return META.vi?.[id]||DB.i?.[id]?.n||('Item '+id); }
+/* ---------- kills while travelling (pre-mount grinding on the way) ---------- */
+/* ---------- exploration XP (subzones from the terrain export) ---------- */
+const EXPL_BASE=[0,5,15,25,35,45,55,65,70,80,85,90,90,90,100,105,115,125,135,145,155,165,175,185,195,200,210,220,230,240,245,250,255,265,270,275,280,285,285,300,315,330,345,360,375,390,405,420,440,455,470,490,510,530,540,560,580,600,620,640,660];
+let EXG=null; function exGrid(){ if(EXG) return EXG; const E=META.expl; if(!E) return null; const n=META.nav.w*META.nav.h; EXG=new Int32Array(n); let k=0; for(let i=0;i<E.rle.length;i+=2){ EXG.fill(E.rle[i],k,k+E.rle[i+1]); k+=E.rle[i+1]; } return EXG; }
+function areaAt(X,Y){ const g=exGrid(); if(!g) return 0; const n=META.nav; const x=Math.floor((X-n.x0)/n.cell), y=Math.floor((Y-n.y0)/n.cell); if(x<0||y<0||x>=n.w||y>=n.h) return 0; return g[y*n.w+x]; }
+function explXP(level,alv){ if(!alv||level>=MAXLVL) return 0; const d=level-alv; if(d<-5) return EXPL_BASE[Math.min(60,level+5)]; if(d>5) return Math.round(EXPL_BASE[alv]*Math.max(0,Math.min(100,100-(d-5)*5))/100); return EXPL_BASE[alv]; }
+function exploreAlong(pts,st,r){ if(route.char.explore===false||!META.expl) return; st.expl=st.expl||new Set(); const found=[];
+  const visit=(X,Y)=>{ const a=areaAt(X,Y); if(!a||st.expl.has(a)||META.zones[a]) return; /* whole zones (e.g. Tirisfal Glades itself) give no exploration XP, only their subzones */ st.expl.add(a); const A=META.expl.areas[a]; const xp=explXP(st.level,A?.[1]); found.push({a,n:A?.[0]||('Area '+a),xp}); if(xp) addXP(st,xp); };
+  const cont=P=>P.X>10000; for(let k=0;k<pts.length;k++){ const p=pts[k]; if(!p) continue; const q=pts[k+1]; if(q&&cont(q)!==cont(p)){ pts[k+1]=null; continue; } visit(p.X,p.Y); if(q){ const d=Math.hypot(q.X-p.X,q.Y-p.Y); if(d>6000) continue; const n=Math.ceil(d/24); for(let j=1;j<n;j++) visit(p.X+(q.X-p.X)*j/n,p.Y+(q.Y-p.Y)*j/n); } }
+  const shown=found.filter(f=>f.xp||!/^Area \d+$/.test(f.n)); if(shown.length){ const xp=found.reduce((t,f)=>t+f.xp,0); r.expl=shown; r.gained+=xp; r.after={level:st.level,xp:st.xp}; } }
+function mobLevelAt(X,Y){ const M=META.mobl; if(!M) return null; const c=M.c, cx=Math.floor(X/c), cy=Math.floor(Y/c); let sum=0,n=0;
+  for(let dx=-1;dx<=1;dx++) for(let dy=-1;dy<=1;dy++){ const v=M.cells[(cx+dx)+','+(cy+dy)]; if(v){ const w=v[1]*(dx||dy?0.5:1); sum+=v[0]*w; n+=w; } } return n?sum/n:null; }
+function isKillObjStep(s){ if(!s.q||!Q(s.q)) return false; const ob=objectives(s.q).filter(o=>!o.pre&&(!s.obj||o.rx===s.obj)); return ob.length>0&&ob.some(o=>o.kind==='kill'||(o.kind==='loot'&&o.pts.some(p=>p.ent?.[0]==='n'))); }
+/* ---------- /played estimate: travel time + kills × time-to-kill + talking ---------- */
+let MOBLV=null; function mobStatsAt(lv){ if(!MOBLV){ MOBLV={}; for(const k in META.mobl?.g||{}) for(const [l,hp,n,arm] of META.mobl.g[k]){ const L=Math.round(l); const o=MOBLV[L]=MOBLV[L]||{hp:0,a:0,n:0}; o.hp+=hp*n; o.a+=(arm>=0?arm:45*L)*n; o.n+=n; } }
+  const o=MOBLV[Math.max(1,Math.min(63,Math.round(lv)))]; return o&&o.n?{hp:o.hp/o.n,a:o.a/o.n}:{hp:40+25*lv,a:45*lv}; }
+const defDown=()=>route.char.cls==='Hunter'?0:10; /* hunters kill on the move with the pet, no eat/drink */
+function killSecs(L,ml){ const c=route.char; const dps=Math.max(1,(+c.dpsl>0?+c.dpsl:5)*L+8), down=c.kdown!==''&&c.kdown!=null&&+c.kdown>=0?+c.kdown:defDown(); const m=mobStatsAt(ml); const dr=Math.min(.75,m.a/(m.a+400+85*L)); return m.hp/(dps*(1-dr))+down; }
+function estimateTimes(res){ let t=0; const c=route.char; const mountL=+c.ypkUntil||40;
+  res.forEach((r,i)=>{ const s=route.steps[i]; let dt=0; if(r.inactive||r.passive!=null){ r.dt=0; r.tAt=t; return; } const L=r.before?.level||1; const run=L>=mountL?11.2:7; const lt=r.leg?.type;
+    const dist=(a,b)=>{ if(!a||!b) return 0; const d=Math.hypot(b.X-a.X,b.Y-a.Y); if(!Number.isFinite(d)) return 0; const ma=a.z!=null?META.zones[a.z]?.m:null, mb=b.z!=null?META.zones[b.z]?.m:null; if(ma!=null&&mb!=null&&ma!=mb) return 0; return Math.min(d,5000); }; /* other continent / huge jump: some other transport, not walking */
+    if(!r.stk){ if(lt==='fly'){ dt+=dist(r.from,r.dep)*1.25/run+dist(r.dep,r.pt)/32+10; } else if(lt==='ride'){ dt+=dist(r.from,r.dep)*1.25/run+150; } else if(lt==='hs'){ dt+=25; } else if(lt==='death'){ dt+=dist(r.from,r.dep)*1.25/run+40; } else dt+=dist(r.from,r.pt)*1.25/run;
+      if(r.path&&r.path.length>1) { let d=0; for(let k=0;k<r.path.length;k++) d+=dist(r.path[k],r.path[(k+1)%r.path.length]); dt+=d/run; } }
+    if(['accept','turnin','train','buy','prof'].includes(s.t)) dt+=5;
+    let kills=0, ml=L; if(r.kill?.kills){ kills+=r.kill.kills; ml=Q(s.q)?Math.min(Q(s.q).l,L+2):L; } dt+=kills*killSecs(L,ml);
+    if(r.walk?.kills) dt+=r.walk.kills*killSecs(L,r.walk.lv||L);
+    if(s.t==='grind'&&r.gained>0&&(!s.src||s.src==='mobs'||s.src==='both')){ const g=Math.max(1,L-2); const per=mobXP(L,g,false,1)||1; dt+=r.gained/per*killSecs(L,g); }
+    r.dt=dt; t+=dt; r.tAt=t; }); }
+const fmtT=sec=>{ sec=Math.round(sec||0); const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60); return d?`${d}d ${h}h ${m}m`:h?`${h}h ${m}m`:`${m}m`; };
+function travelKills(a,b,st,yp){ const ypk=+(yp??route.char.ypk)||0; if(!ypk||!a||!b) return null; const d=Math.hypot(b.X-a.X,b.Y-a.Y); if(d<30||d>6000) return null;
+  const walk=d*1.2, n=Math.max(1,Math.ceil(d/60)); let xp=0,kills=0,lvs=0,m=0;
+  for(let k=0;k<n;k++){ const t=(k+0.5)/n; const lv=mobLevelAt(a.X+(b.X-a.X)*t,a.Y+(b.Y-a.Y)*t); if(lv==null) continue; const kk=walk/n/ypk; const per=mobXP(st.level,Math.round(lv),false,st.party||1); kills+=kk; xp+=kk*per; lvs+=lv; m++; }
+  return xp>0?{xp:Math.round(xp),kills,lv:lvs/m}:null; }
+function calibrateYpk(idx,level,xp){ const want=totalXP(level,xp); const keep=route.char.ypk; let lo=5,hi=20000,best=null;
+  const at=y=>{ route.char.ypk=y; simulate(); const a=SIM.res[idx]?.after; return a?totalXP(a.level,a.xp):0; };
+  if(at(hi)>want){ route.char.ypk=keep; simulate(); return {err:'The planner is already past that level/XP at that step without travel kills.'}; }
+  if(at(lo)<want){ route.char.ypk=keep; simulate(); return {err:'Even 1 kill every 5 yards doesn\u2019t reach that; check the step, level and XP.'}; }
+  for(let i=0;i<40;i++){ const mid=Math.sqrt(lo*hi); if(at(mid)>=want) lo=mid; else hi=mid; } best=(y=>y<100?Math.round(y*10)/10:Math.round(y))(Math.sqrt(lo*hi)); route.char.ypk=best; simulate(); return {ypk:best}; }
+const pinnable=s=>!(s.t==='travel'&&['fly','ride','hs'].includes(s.kind))&&!(s.t==='prof'&&s.act==='craft');
+function stepPoint(s,ref){
+  if(s.pin&&pinnable(s)) return zp2plane(s.pin.z,s.pin.px,s.pin.py);
+  if(s.t==='accept'&&s.shared) return null;
+  if(s.t==='prof'){ if(s.act==='craft') return null; const t=ptrainerOf(s.npc); return t?nearest(ptrainerPts(t),ref):null; }
+  if(s.t==='deathskip'){ return gyAt(s.gy); }
+  if(s.t==='collect'){ return s.loc?zp2plane(s.loc.z,s.loc.px,s.loc.py):nearest(itemSourcePts(s.item,'loot'),ref); }
+  if(s.t==='train'){ const t=trainerOf(s.npc); return t?nearest(trainerPts(t),ref):null; }
+  if(s.t==='buy'){ const v=vendorOf(s.npc); return v?nearest(vendorPts(v),ref):(s.loc?zp2plane(s.loc.z,s.loc.px,s.loc.py):null); }
+  if(s.loc) return zp2plane(s.loc.z,s.loc.px,s.loc.py);
+  if(!s.q||!Q(s.q)) return null;
+  if(s.t==='accept') return nearest(starterPts(s.q),ref) || nearest(Q(s.q).s.i.flatMap(i=>itemSourcePts(i,'item')),ref);
+  if(s.t==='turnin') return nearest(finisherPts(s.q),ref);
+  if(s.t==='complete') return objPoint(s.q,s.obj,ref);
+  return null;
+}
+function computeAvailable(st){
+  const out=[]; const logNames=new Set([...st.log.keys()].map(k=>Q(k)?.n).filter(Boolean));
+  for(const id in DB.q){
+    const qid=+id; const w=whyUnavailable(qid,st,route);
+    if(!w) out.push({qid,ok:true});
+    else if(w.level && w.level<=st.level+3 && !w.hard) out.push({qid,ok:false,level:w.level});
+    else if(w.pre && !w.hard){ const q=Q(qid); if(q.l>grayLevel(st.level) && q.l<=st.level+4 && !logNames.has(q.n)){ const roots=lockRoots(qid,st); if(roots) out.push({qid,ok:false,locked:true,roots}); } }
+  }
+  return out;
+}
+// quests in your level range that are locked behind a prerequisite you haven't picked up; follow-ups of quests you're on are left out
+function lockRoots(qid,st){
+  const seen=new Set(), roots=new Set(); let stop=false;
+  const visit=(id,depth)=>{ if(stop||seen.has(id)||depth>15) return; seen.add(id); const q=Q(id); if(!q) return;
+    if(st.log.has(id)){ stop=true; return; } if(st.turned.has(id)) return;
+    const w=whyUnavailable(id,st,route); if(w&&w.hard){ stop=true; return; }
+    const miss=[]; if(q.pg) for(const p of q.pg) if(Q(p)&&!st.turned.has(p)) miss.push(p);
+    if(q.ps && !q.ps.some(p=>st.turned.has(p)||!Q(p))){ const c=q.ps.filter(Q); if(c.some(p=>st.log.has(p))){ stop=true; return; } const good=c.find(p=>!whyUnavailable(p,st,route)?.hard); if(good) miss.push(good); else { stop=true; return; } }
+    if(!miss.length){ if(depth===0) return; if(w&&!w.level){ stop=true; return; } roots.add(id); return; }
+    for(const p of miss) visit(p,depth+1);
+  };
+  visit(qid,0); return stop||!roots.size?null:[...roots];
+}
+function nearZones(){
+  // zones near the cursor step
+  const r=SIM.res[cursor]; let pt=r?.pt;
+  if(!pt){ for(let i=cursor;i>=0;i--) if(SIM.res[i]?.pt){pt=SIM.res[i].pt;break;} }
+  if(!pt){ const s=START[route.char.race]; if(s) pt=zp2plane(...s); else { const cap=route.char.faction==='H'?1637:1519; pt=zp2plane(cap,50,50); } }
+  if(!pt) return null;
+  return {z:pt.z,pt};
+}
+
+/* ---------- kill XP while questing (estimate) ---------- */
+let QGIVERS=null;
+function isQuestGiver(id){ if(!QGIVERS){ QGIVERS=new Set(); for(const q of Object.values(DB.q)){ q.s.n.forEach(n=>QGIVERS.add(n)); q.f.n.forEach(n=>QGIVERS.add(n)); } } return QGIVERS.has(+id); }
+function isUniqueMob(id){ const pts=entPts('n',id); const l=DB.n[id]?.l; if(!pts.length||pts.every(p=>p.dg)) return !!(l&&l[0]===l[1]); return pts.length===1; }
+function genericDrop(src){ if(src.length<25) return false; const ls=src.map(n=>DB.n[n]?.l).filter(Boolean); if(!ls.length) return true; return Math.max(...ls.map(l=>l[1]))-Math.min(...ls.map(l=>l[0]))>20; }
+function killCfg(){ const c=route.char; return {on:c.killxp!==false, rate:Math.max(5,Math.min(100,+c.droprate||60))/100, def:Math.max(1,+c.defcount||8), dg:2/(+c.dgdiv>0?+c.dgdiv:3.5)}; }
+function npcInfo(id){ const n=DB.n[id]; if(!n||!n.l) return null; const pts=entPts('n',id); return {l:Math.round((n.l[0]+n.l[1])/2),elite:n.rk===1||n.rk===2||n.rk===3,dg:pts.length>0&&pts.every(p=>p.dg)}; }
+/* ---------- money estimate (CMaNGOS classic-db: coins + vendor value of drops per kill, quest money rewards) ---------- */
+const killMoney=(id,lv)=>{ const M=META.money; if(!M) return 0; const v=M.kill?.[id]; if(v!=null) return v; return M.killL?.[Math.max(1,Math.round(lv||1))]||0; };
+const lvlMoney=lv=>META.money?.killL?.[Math.max(1,Math.round(lv||1))]||0;
+function questMoney(qid){ const M=META.money; const q=Q(qid); if(!M||!q) return 0; const v=M.quest?.[qid]; if(v!=null) return v; return q.fv?(M.questL?.[q.l]||0):0; }
+function questItemMoney(qid){ const M=META.money; const q=Q(qid); if(!M||!q) return 0; const v=M.qitem?.[qid]; if(v!=null) return v; return q.fv?(M.qitemL?.[q.l]||0):0; } /* reward items at vendor value (best choice item) */
+const fmtG=c=>{ c=Math.round(c||0); const neg=c<0; c=Math.abs(c); const g=Math.floor(c/1e4), sv=Math.floor(c%1e4/100), cp=c%100; return (neg?'−':'')+(g?g+'g ':'')+(g||sv?sv+'s ':'')+cp+'c'; };
+function perKillXP(ids,st,cfg){
+  const fac=route.char.faction; let best=null;
+  for(const id of ids){ const n=DB.n[id]; if(!n||n.fr===fac||(isQuestGiver(id)&&ids.length===1&&!n.rk)) continue; const ni=npcInfo(id); if(!ni) continue;
+    const d=Math.abs(ni.l-st.level); if(!best||d<best.d) best={ni,d,id}; }
+  if(!best) return {xp:0,none:true,money:0}; const ni=best.ni; return {xp:mobXP(st.level,ni.l,ni.elite,st.party||1,ni.dg?cfg.dg:0),dg:ni.dg,money:killMoney(best.id,ni.l)/(st.party||1)};
+}
+function killEstimate(qid,counts,st,skip){
+  const cfg=killCfg(); const q=Q(qid); if(!cfg.on||!q) return {xp:0,kills:0,guessed:false};
+  const o=q.o||{}; let idx=1, xp=0, kills=0, guessed=false, dg=false, money=0;
+  const cnt=(uniq)=>{ const c=counts&&counts[idx]; if(c) return +c; if(uniq) return 1; guessed=true; return cfg.def; };
+  const use=()=>!(skip&&skip(idx));
+  for(const [id] of o.c||[]){ if(!use()){ idx++; continue; } const n=cnt(isUniqueMob(id)); const k=perKillXP([id],st,cfg); xp+=k.xp*n; money+=(k.money||0)*n; kills+=n; dg=dg||k.dg; idx++; }
+  for(const _ of o.o||[]) idx++;
+  for(const [id] of o.i||[]){ const src=DB.i[id]?.d||[]; if(src.length&&!genericDrop(src)&&use()){ const boss=src.length<=2&&src.every(n=>isUniqueMob(n)); const n=boss?1:Math.ceil(cnt()/cfg.rate); const k=perKillXP(src,st,cfg); xp+=k.xp*n; money+=(k.money||0)*n; kills+=n; dg=dg||k.dg; } idx++; }
+  for(const [ids,base] of o.k||[]){ if(!use()){ idx++; continue; } const n=cnt(); const k=perKillXP(base?[base,...ids]:ids,st,cfg); xp+=k.xp*n; money+=(k.money||0)*n; kills+=n; dg=dg||k.dg; idx++; }
+  return {xp:Math.round(xp),kills,guessed,dg,money};
+}
+
+/* ---------- map ---------- */
+const canvas=$('#map'); const ctx=canvas.getContext('2d');
+const mctx=document.createElement('canvas').getContext('2d');
+let W=0,H=0,DPR=1;
+const view={s:0.03,tx:0,ty:0};
+const zonePaths=new Map(); let landPaths=[];
+const layers={vendors:true,avail:true,locked:true,trivial:false,objectives:true,route:true,fp:true,towns:true,dungeons:true,relief:true,heat:false};
+const reliefImgs=[];
+function loadRelief(){ for(const [m,r] of Object.entries(META.relief||{})){ const o={...r,m,ri:new Image(),wi:new Image(),rs:new Set(r.tile?.r||[]),ws:new Set(r.tile?.w||[])}; o.ri.onload=o.wi.onload=requestDraw; o.ri.src='data:image/webp;base64,'+r.rel; o.wi.src='data:image/webp;base64,'+r.wat; reliefImgs.push(o);} }
+const _cv={}; function offCtx(n){ let c=_cv[n]; if(!c){ c=_cv[n]=document.createElement('canvas').getContext('2d'); } if(c.canvas.width!==canvas.width||c.canvas.height!==canvas.height){ c.canvas.width=canvas.width; c.canvas.height=canvas.height; } return c; }
+const landCtx=()=>offCtx('land'), maskCtx=()=>offCtx('mask');
+const tileCache=new Map();
+// close-up terrain tiles live in one pack file per continent (tiles/terrainN.bin: 4-byte header length, JSON index, WebP images)
+const packs={};
+function packFor(m){ let p=packs[m]; if(p) return p; p=packs[m]={state:'loading'};
+  fetch(`tiles/terrain${m}.bin`).then(r=>{ if(!r.ok) throw new Error(r.status); return r.arrayBuffer(); }).then(b=>{ const n=new DataView(b).getUint32(0,true); p.idx=JSON.parse(new TextDecoder().decode(new Uint8Array(b,4,n))); p.base=4+n; p.buf=b; p.state='ok'; requestDraw(); }).catch(()=>{ p.state='fail'; }); return p; }
+function tileImg(m,name){ const key=m+'/'+name; let im=tileCache.get(key); if(im){ tileCache.delete(key); tileCache.set(key,im); return im.complete&&im.naturalWidth?im:null; }
+  const p=packFor(m); if(p.state==='loading') return null; let url;
+  if(p.state==='ok'){ const e=p.idx[name]; if(!e) return null; url=URL.createObjectURL(new Blob([new Uint8Array(p.buf,p.base+e[0],e[1])],{type:'image/webp'})); } else url=`tiles/${name}.webp`; // no pack file: fall back to single tile images
+  im=new Image(); im._u=url.startsWith('blob:')?url:null; im.onload=requestDraw; im.src=url; tileCache.set(key,im);
+  while(tileCache.size>60){ const k=tileCache.keys().next().value; const x=tileCache.get(k); tileCache.delete(k); if(x._u) URL.revokeObjectURL(x._u); x.src=''; } return null; }
+const HIRES_S=0.1;
+function reliefDraw(g,kind){
+  const s=view.s, vx0=-view.tx/s, vy0=-view.ty/s, vx1=(W-view.tx)/s, vy1=(H-view.ty)/s;
+  for(const o of reliefImgs){ const ov=kind==='r'?o.ri:o.wi; if(!ov.complete||!ov.naturalWidth) continue;
+    if(o.x>vx1||o.y>vy1||o.x+o.w<vx0||o.y+o.h<vy0) continue;
+    const t=o.tile; if(s<HIRES_S||!t){ g.drawImage(ov,o.x,o.y,o.w,o.h); continue; }
+    const set=kind==='r'?o.rs:o.ws, sc=ov.naturalWidth/o.w;
+    const tx0=Math.max(0,Math.floor((vx0-o.x)/t.yd)), tx1=Math.min(t.nx-1,Math.floor((vx1-o.x)/t.yd)), ty0=Math.max(0,Math.floor((vy0-o.y)/t.yd)), ty1=Math.min(t.ny-1,Math.floor((vy1-o.y)/t.yd));
+    for(let ty=ty0;ty<=ty1;ty++) for(let tx=tx0;tx<=tx1;tx++){ const k=ty+'_'+tx; if(!set.has(k)) continue;
+      const X=o.x+tx*t.yd, Y=o.y+ty*t.yd, tw=Math.min(t.yd,o.w-tx*t.yd), th=Math.min(t.yd,o.h-ty*t.yd);
+      const im=tileImg(o.m,`t${o.m}_${k}_${kind}`);
+      if(im) g.drawImage(im,X,Y,im.naturalWidth*t.yd/t.px,im.naturalHeight*t.yd/t.px);
+      else { const sx=(X-o.x)*sc, sy=(Y-o.y)*sc; g.drawImage(ov,sx,sy,Math.min(tw*sc,ov.naturalWidth-sx),Math.min(th*sc,ov.naturalHeight-sy),X,Y,Math.min(tw*sc,ov.naturalWidth-sx)/sc,Math.min(th*sc,ov.naturalHeight-sy)/sc); }
+    }
+  }
+}
+const BIOME={14:'#bf8c58',215:'#b3a35e',17:'#c6a667',141:'#6f9557',148:'#7c8c6c',331:'#5f8250',400:'#bf9d72',406:'#8b8669',405:'#a8a08b',357:'#5e8d4f',15:'#6f7c59',440:'#d9bb78',16:'#b98163',361:'#6e6d4c',490:'#6f9141',493:'#86a482',1377:'#caa76b',618:'#e3e8ea',616:'#80a360',16651:'#8e8b6b',16606:'#a3b36f',
+  85:'#8d9063',130:'#71805f',28:'#908c6b',139:'#8a7a62',267:'#91a369',36:'#d9dde0',45:'#a9a56c',47:'#80a063',1:'#e2e7ea',38:'#a0a26c',11:'#6c8259',3:'#bd8a5b',51:'#8e5d47',46:'#71503f',12:'#80a458',40:'#ccb46c',44:'#ad8a52',10:'#56644c',41:'#716e63',33:'#5c8d48',8:'#607050',4:'#ad7551',16591:'#7d9d68'};
+function mix(a,b,t){ const pa=[1,3,5].map(i=>parseInt(a.slice(i,i+2),16)), pb=[1,3,5].map(i=>parseInt(b.slice(i,i+2),16)); return 'rgb('+pa.map((v,i)=>Math.round(v+(pb[i]-v)*t)).join(',')+')'; }
+function buildPaths(){
+  for(const [m,c] of Object.entries(META.geo.cont)){
+    const off=META.off[m]; const land=new Path2D();
+    for(const r of c.coast){ land.moveTo(r[0]+off[0],r[1]+off[1]); for(let i=2;i<r.length;i+=2) land.lineTo(r[i]+off[0],r[i+1]+off[1]); land.closePath(); }
+    landPaths.push(land);
+    for(const [z,rings] of Object.entries(c.zones)){
+      const p=new Path2D(); for(const r of rings){ p.moveTo(r[0]+off[0],r[1]+off[1]); for(let i=2;i<r.length;i+=2) p.lineTo(r[i]+off[0],r[i+1]+off[1]); p.closePath(); }
+      zonePaths.set(+z,p);
+    }
+  }
+}
+let paperPat=null, seaPat=null;
+function makePatterns(){
+  const mk=(size,fn)=>{ const c=document.createElement('canvas'); c.width=c.height=size; const g=c.getContext('2d'); const im=g.createImageData(size,size); for(let i=0;i<size*size;i++){ const [r,gg,b,a]=fn(i%size,Math.floor(i/size)); im.data.set([r,gg,b,a],i*4);} g.putImageData(im,0,0); return c; };
+  let seed=7; const rnd=()=>{ seed=(seed*16807)%2147483647; return seed/2147483647; };
+  const n=new Float32Array(256*256).map(()=>rnd());
+  const sm=(x,y)=>{ let s=0; for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++) s+=n[((y+dy+256)%256)*256+((x+dx+256)%256)]; return s/25; };
+  const paper=mk(256,(x,y)=>{ const v=sm(x,y)*0.6+n[y*256+x]*0.4; const k=Math.round(90+v*120); return [k,k*0.86|0,k*0.62|0,34]; });
+  const sea=mk(256,(x,y)=>{ const v=Math.sin((x+sm(x,y)*60)/9)*0.5+0.5; return [220,235,240,Math.round(v*14)]; });
+  paperPat=ctx.createPattern(paper,'repeat'); seaPat=ctx.createPattern(sea,'repeat');
+}
+function resize(){
+  const r=canvas.getBoundingClientRect(); DPR=Math.min(2,window.devicePixelRatio||1);
+  W=r.width; H=r.height; canvas.width=Math.round(W*DPR); canvas.height=Math.round(H*DPR); requestDraw();
+}
+const BOUNDS={x0:-4600,y0:-11800,x1:20800,y1:9900};
+function fitAll(){ const s=Math.min(W/(BOUNDS.x1-BOUNDS.x0),H/(BOUNDS.y1-BOUNDS.y0))*0.95; view.s=s; view.tx=W/2-s*(BOUNDS.x0+BOUNDS.x1)/2; view.ty=H/2-s*(BOUNDS.y0+BOUNDS.y1)/2; requestDraw(); }
+function flyTo(X,Y,s){ view.s=s||Math.max(view.s,0.09); view.tx=W/2-X*view.s; view.ty=H/2-Y*view.s; requestDraw(); }
+function flyToZone(z){ const Z=META.zones[z]; if(!Z) return; const a=zp2plane(z,0,0), b=zp2plane(z,100,100); const s=Math.min(W/Math.abs(b.X-a.X),H/Math.abs(b.Y-a.Y))*0.95; flyTo((a.X+b.X)/2,(a.Y+b.Y)/2,s); }
+const MINS=0.004, MAXS=3;
+function zoomAt(f,sx,sy){ const ns=Math.max(MINS,Math.min(MAXS,view.s*f)); const k=ns/view.s; view.tx=sx-(sx-view.tx)*k; view.ty=sy-(sy-view.ty)*k; view.s=ns; requestDraw(); }
+let drawPending=false; function requestDraw(){ if(!drawPending){ drawPending=true; requestAnimationFrame(()=>{drawPending=false; draw();}); } }
+const toS=p=>[p.X*view.s+view.tx, p.Y*view.s+view.ty];
+let hits=[];
+const zoneImgs=new Map(); let imgOpacity=0.95;
+
+function draw(){
+  if(!META||!SIM) return;
+  const s=view.s; hits=[];
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  ctx.fillStyle='#2c4a55'; ctx.fillRect(0,0,W,H);
+  const gr=ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.2,W/2,H/2,Math.max(W,H)*0.8); gr.addColorStop(0,'rgba(80,120,130,.35)'); gr.addColorStop(1,'rgba(10,20,25,.45)'); ctx.fillStyle=gr; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle=seaPat; ctx.fillRect(0,0,W,H);
+  ctx.setTransform(DPR*s,0,0,DPR*s,DPR*view.tx,DPR*view.ty);
+  // shallows
+  ctx.lineJoin='round';
+  if(!(layers.relief&&reliefImgs.length)) for(const lp of landPaths){ ctx.strokeStyle='rgba(120,165,165,.35)'; ctx.lineWidth=Math.max(260,14/s); ctx.stroke(lp); ctx.strokeStyle='rgba(150,190,180,.35)'; ctx.lineWidth=Math.max(110,6/s); ctx.stroke(lp); }
+  const useRel=layers.relief&&reliefImgs.length&&reliefImgs.every(o=>o.ri.complete);
+  const g=useRel?landCtx():ctx;
+  if(useRel){ g.setTransform(1,0,0,1,0,0); g.clearRect(0,0,g.canvas.width,g.canvas.height); g.setTransform(DPR*s,0,0,DPR*s,DPR*view.tx,DPR*view.ty); g.lineJoin='round'; }
+  g.fillStyle=mix('#9a9272','#d9c69a',0.42); for(const lp of landPaths) g.fill(lp);
+  for(const [z,p] of zonePaths){ g.fillStyle=mix(BIOME[z]||'#b7a574','#d9c69a',0.42); g.fill(p); }
+  g.save();
+  if(!useRel){ const all=new Path2D(); for(const lp of landPaths) all.addPath(lp); g.clip(all); }
+  else { g.imageSmoothingEnabled=true; g.imageSmoothingQuality='high'; g.globalCompositeOperation='overlay'; g.globalAlpha=1; reliefDraw(g,'r'); g.globalAlpha=1; g.globalCompositeOperation='source-over'; }
+  g.setTransform(DPR,0,0,DPR,0,0); g.globalCompositeOperation='multiply'; g.fillStyle=paperPat; g.fillRect(0,0,W,H); g.globalCompositeOperation='source-over';
+  g.restore();
+  // user zone images
+  if(zoneImgs.size && s>0.03){
+    g.globalAlpha=Math.min(1,(s-0.03)/0.03)*imgOpacity;
+    for(const [z,img] of zoneImgs){ const a=zp2plane(z,0,0), b=zp2plane(z,100,100); if(a&&b) g.drawImage(img,a.X,a.Y,b.X-a.X,b.Y-a.Y); }
+    g.globalAlpha=1;
+  }
+  g.strokeStyle='rgba(60,40,20,.55)'; g.lineWidth=1.3/s; g.setLineDash([]);
+  for(const [z,p] of zonePaths){ if(META.zones[z]?.ap){ g.setLineDash([5/s,4/s]); g.stroke(p); g.setLineDash([]);} else g.stroke(p); }
+  if(useRel){
+    g.globalAlpha=0.9; reliefDraw(g,'w'); g.globalAlpha=1;
+    // cut the coastline out of the land using the relief images' alpha (fine ocean mask)
+    const k=maskCtx(); k.setTransform(1,0,0,1,0,0); k.globalCompositeOperation='source-over'; k.clearRect(0,0,k.canvas.width,k.canvas.height);
+    k.setTransform(DPR*s,0,0,DPR*s,DPR*view.tx,DPR*view.ty); k.imageSmoothingEnabled=true;
+    reliefDraw(k,'r');
+    g.setTransform(1,0,0,1,0,0); g.globalCompositeOperation='destination-in'; g.drawImage(k.canvas,0,0); g.globalCompositeOperation='source-over';
+    ctx.setTransform(1,0,0,1,0,0); ctx.save(); ctx.shadowColor='rgba(160,205,195,.6)'; ctx.shadowBlur=Math.min(50,Math.max(5,160*s))*DPR; ctx.drawImage(g.canvas,0,0); ctx.shadowColor='rgba(40,28,12,.95)'; ctx.shadowBlur=2.5*DPR; ctx.drawImage(g.canvas,0,0); ctx.restore();
+    ctx.setTransform(DPR*s,0,0,DPR*s,DPR*view.tx,DPR*view.ty);
+  } else { ctx.strokeStyle='#3a2915'; ctx.lineWidth=1.8/s; for(const lp of landPaths) ctx.stroke(lp); }
+  // Zephras Isle (floating, position illustrative)
+  ctx.beginPath(); ctx.ellipse(11200,-9800,900,600,0,0,Math.PI*2); ctx.fillStyle=mix('#b6c7d9','#d9c69a',0.35); ctx.fill(); ctx.setLineDash([6/s,5/s]); ctx.strokeStyle='#3a2915'; ctx.stroke(); ctx.setLineDash([]);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  drawLabels(); drawPOIs(); drawGhosts(); if(layers.route){ drawPaths(); drawRoute(); } drawQuests(); drawFQ();
+  $('#status').textContent=s>=0.035?'':'Zoom in to see towns'+(s<0.03?', flight paths and dungeons':'');
+}
+function haloText(t,x,y,font,fill,stroke,lw){ ctx.font=font; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.lineJoin='round'; ctx.strokeStyle=stroke; ctx.lineWidth=lw; ctx.strokeText(t,x,y); ctx.fillStyle=fill; ctx.fillText(t,x,y); }
+function drawLabels(){
+  const s=view.s;
+  if(s<0.02){
+    const kx=[3000,-900], ek=[14300+1700,-5800+5800];
+    haloText('Kalimdor',kx[0]*s+view.tx,kx[1]*s+view.ty,`${Math.max(18,Math.min(34,s*1500))}px Marcellus, serif`,'#f6e7bf','rgba(30,20,8,.8)',4);
+    haloText('Eastern Kingdoms',ek[0]*s+view.tx,ek[1]*s+view.ty,`${Math.max(18,Math.min(34,s*1500))}px Marcellus, serif`,'#f6e7bf','rgba(30,20,8,.8)',4);
+  }
+  if(s>=0.012 && s<0.3){
+    for(const [z,pt] of Object.entries(META.labels)){
+      const Z=META.zones[z]; if(!Z) continue; const off=META.off[Z.m];
+      const x=(pt[0]+off[0])*s+view.tx, y=(pt[1]+off[1])*s+view.ty; if(x<-100||x>W+100||y<-50||y>H+50) continue;
+      const fs=Math.max(11,Math.min(22,s*420)); const a=s>0.14?Math.max(0,0.6-(s-0.14)/0.2):(s>0.05?0.7:1); ctx.globalAlpha=a;
+      haloText(Z.n+(Z.ap?' *':''),x,y,`${fs}px Marcellus, serif`,'#fff1c9','rgba(35,22,8,.85)',3.5);
+      if(Z.lv && s>0.03) haloText(Z.lv,x,y+fs*0.95,`${Math.max(10,fs*0.62)}px "Alegreya Sans", sans-serif`,'#ffd65a','rgba(35,22,8,.85)',3);
+      ctx.globalAlpha=1;
+    }
+  }
+  if(s>=0.02 && s<0.3){ const p={X:11200,Y:-9800}; const [x,y]=toS(p); haloText('Zephras Isle *',x,y,`${Math.max(11,Math.min(20,s*420))}px Marcellus, serif`,'#fff1c9','rgba(35,22,8,.85)',3.5); }
+  // cities
+  if(s>=0.006){
+    for(const [z,Z] of Object.entries(META.zones)){ if(!Z.city) continue; const p=zp2plane(z,50,50); const [x,y]=toS(p);
+      ctx.fillStyle='#2b1c0b'; ctx.beginPath(); ctx.arc(x,y,4.5,0,7); ctx.fill(); ctx.fillStyle='#ffd65a'; ctx.beginPath(); ctx.arc(x,y,3,0,7); ctx.fill();
+      if(s>0.02) haloText(Z.n,x,y-12,`${Math.max(11,Math.min(17,s*300))}px Marcellus, serif`,'#fff1c9','rgba(35,22,8,.9)',3);
+      hits.push({x,y,r:8,kind:'town',label:Z.n,loc:{z:+z,px:50,py:50}});
+    }
+  }
+}
+function drawPOIs(){
+  const s=view.s; const fac=charInfo(route).fac;
+  if(layers.towns && s>=0.035){
+    for(const [z,x0,y0,name] of META.towns){ const p=zp2plane(z,x0,y0); if(!p) continue; const [x,y]=toS(p); if(x<-50||x>W+50||y<-20||y>H+20) continue;
+      ctx.fillStyle='#2b1c0b'; ctx.fillRect(x-3.5,y-3.5,7,7); ctx.fillStyle='#f3e2b5'; ctx.fillRect(x-2,y-2,4,4);
+      haloText(name,x,y+12,`${Math.max(11,Math.min(15,s*140))}px "Alegreya Sans", sans-serif`,'#fff4d8','rgba(35,22,8,.9)',3);
+      hits.push({x,y,r:8,kind:'town',label:name,loc:{z,px:x0,py:y0}});
+    }
+  }
+  if(layers.vendors && s>=0.3 && META.vend){ const placed=[]; const spread=([x,y])=>{ for(let k=0;k<12;k++){ if(!placed.some(([a,b])=>Math.hypot(a-x,b-y)<13)) break; const ang=k*2.4, rr=13+2*k; x+=Math.cos(ang)*rr*(k?0.55:1); y+=Math.sin(ang)*rr*(k?0.55:1); } placed.push([x,y]); return [x,y]; }; ctx.font='700 10px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    for(const id in META.vend){ const v=vendorOf(id); if(!vendorOK(v)) continue; for(const p of vendorPts(v)){ let [x,y]=toS(p); if(x<-10||x>W+10||y<-10||y>H+10) continue; [x,y]=spread([x,y]);
+      ctx.fillStyle='#5a3d0a'; ctx.beginPath(); ctx.arc(x,y,5.5,0,7); ctx.fill(); ctx.strokeStyle='#ffd24a'; ctx.lineWidth=1.3; ctx.stroke(); ctx.fillStyle='#ffd24a'; ctx.fillText('¤',x,y+.5);
+      hits.push({x,y,r:7,kind:'vendor',vid:v.id,label:v.name}); } }
+    for(const g of gyPts()){ let [x,y]=toS(g); if(x<-10||x>W+10||y<-10||y>H+10) continue; [x,y]=spread([x,y]); ctx.fillStyle='#2b2140'; ctx.beginPath(); ctx.arc(x,y,6.5,0,7); ctx.fill(); ctx.strokeStyle='#c8aaff'; ctx.lineWidth=1.4; ctx.stroke(); ctx.fillStyle='#e9dcff'; ctx.font='700 10px sans-serif'; ctx.fillText('✝',x,y+.5); hits.push({x,y,r:8,kind:'gy',gi:g.gi,label:g.label}); }
+    for(const id in META.ptrn||{}){ const t=ptrainerOf(id); if(!vendorOK(t)) continue; for(const p of ptrainerPts(t)){ let [x,y]=toS(p); if(x<-10||x>W+10||y<-10||y>H+10) continue; [x,y]=spread([x,y]); ctx.fillStyle='#153a22'; ctx.beginPath(); ctx.arc(x,y,6.5,0,7); ctx.fill(); ctx.strokeStyle='#8fe0a8'; ctx.lineWidth=1.4; ctx.stroke(); ctx.fillStyle='#c9f5d6'; ctx.font='700 9px sans-serif'; ctx.fillText('⚒',x,y+.5); hits.push({x,y,r:8,kind:'ptrainer',pid:t.id,label:t.name+' ('+t.sub+')'}); } }
+    for(const t of myTrainers()) for(const p of trainerPts(t)){ let [x,y]=toS(p); if(x<-10||x>W+10||y<-10||y>H+10) continue; [x,y]=spread([x,y]); ctx.fillStyle='#1d2a55'; ctx.beginPath(); ctx.arc(x,y,6.5,0,7); ctx.fill(); ctx.strokeStyle='#9fc0ff'; ctx.lineWidth=1.4; ctx.stroke(); ctx.fillStyle='#cfe0ff'; ctx.font='700 9px sans-serif'; ctx.fillText('✦',x,y+.5); hits.push({x,y,r:8,kind:'trainer',tid:t.id,label:t.name+' ('+t.cls+' trainer)'}); } }
+  if(layers.dungeons && s>=0.03){ const seen=[];
+    for(const [aid,d] of Object.entries(META.dungeons)){ for(const [z,x0,y0] of d.l){ const p=zp2plane(z,x0,y0); if(!p) continue; const [x,y]=toS(p);
+      ctx.save(); ctx.translate(x,y); ctx.fillStyle='#2a1030'; ctx.beginPath(); ctx.arc(0,0,7,0,7); ctx.fill(); ctx.strokeStyle='#c68bf0'; ctx.lineWidth=1.6; ctx.beginPath(); for(let a=0;a<9;a+=0.3){ const r=0.6*a; ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r);} ctx.stroke(); ctx.restore();
+      if(s>0.05 && !seen.some(([a,b,n])=>n===d.n&&Math.hypot(a-x,b-y)<60)){ seen.push([x,y,d.n]); } else if(s>0.05) {} ; if(s>0.05 && seen.some(([a,b,n])=>n===d.n&&a===x&&b===y)) haloText(d.n,x,y-13,`12px "Alegreya Sans", sans-serif`,'#e9c9ff','rgba(20,8,24,.9)',3);
+      hits.push({x,y,r:9,kind:'dungeon',label:d.n,p}); } }
+  }
+  if(layers.fp && s>=0.03){
+    for(const d of rideDocks()){ const rides=d.rides.filter(r=>r.f.includes(fac)); if(!rides.length) continue; const [x,y]=toS(d.p); if(x<-20||x>W+20||y<-20||y>H+20) continue;
+      ctx.fillStyle='#1d5f86'; ctx.strokeStyle='#bfe6ff'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.arc(x,y,8,0,7); ctx.fill(); ctx.stroke();
+      ctx.fillStyle='#e8f6ff'; ctx.font='bold 10px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(rides[0].kind==='boat'?'⛵':rides[0].kind==='Zeppelin'?'Z':'T',x,y+0.5);
+      hits.push({x,y,r:10,kind:'dock',label:d.label+' — '+rides.map(r=>r.dest).join(', '),dock:d,rides}); }
+    for(const [id,n] of Object.entries(DB.n)){ if(!n.fp) continue; const fr=n.fr||''; if(fr && !fr.includes(fac)) continue;
+      for(const p of entPts('n',id).slice(0,1)){ const [x,y]=toS(p); if(x<-20||x>W+20||y<-20||y>H+20) continue;
+        ctx.save(); ctx.translate(x,y); ctx.fillStyle=fr.length===2?'#6b5a2a':(fr==='H'?'#8e2a1f':'#27488e'); ctx.strokeStyle='#f6d88a'; ctx.lineWidth=1.5;
+        ctx.beginPath(); ctx.moveTo(0,-8); ctx.lineTo(8,0); ctx.lineTo(0,8); ctx.lineTo(-8,0); ctx.closePath(); ctx.fill(); ctx.stroke();
+        ctx.fillStyle='#f6d88a'; ctx.beginPath(); ctx.moveTo(-5,1); ctx.quadraticCurveTo(-2,-4,0,0); ctx.quadraticCurveTo(2,-4,5,1); ctx.quadraticCurveTo(0,-1,-5,1); ctx.fill(); ctx.restore();
+        hits.push({x,y,r:10,kind:'fp',label:n.n+' — '+(n.sn||'Flight Master'),npc:+id,loc:{z:p.z,px:p.px,py:p.py}});
+      }
+    }
+  }
+}
+function qmark(x,y,ch,fill,size){
+  const h=size, w=size*0.34; ctx.save(); ctx.translate(x,y); ctx.lineJoin='round';
+  const path=new Path2D();
+  if(ch==='!'){
+    path.moveTo(-w*0.62,-h*0.5); path.lineTo(w*0.62,-h*0.5); path.lineTo(w*0.3,h*0.14); path.lineTo(-w*0.3,h*0.14); path.closePath();
+    path.moveTo(w*0.42,h*0.36); path.arc(0,h*0.36,w*0.42,0,Math.PI*2);
+  } else {
+    const r=h*0.26, cy=-h*0.2, t=w*0.55;
+    path.moveTo(-r-t/2,cy); path.arc(0,cy,r+t/2,Math.PI,Math.PI*2.35,false); path.lineTo(t/2,h*0.14); path.lineTo(-t/2,h*0.14); path.lineTo(-t/2,h*0.02);
+    path.arc(0,cy,r-t/2,Math.PI*0.35,Math.PI,true); path.closePath();
+    path.moveTo(w*0.42,h*0.36); path.arc(0,h*0.36,w*0.42,0,Math.PI*2);
+  }
+  ctx.strokeStyle='#1a1206'; ctx.lineWidth=Math.max(2.5,size*0.16); ctx.stroke(path); ctx.fillStyle=fill; ctx.fill(path);
+  ctx.restore();
+}
+const QCOL=['#ff6b6b','#5ec8ff','#ffd24a','#8ef08e','#ff9de2','#c49bff','#ffae57','#6effd8','#f5f5a0','#9fb6ff'];
+function qColor(qid){ return QCOL[qid%QCOL.length]; }
+function drawQuests(){
+  const s=view.s; const st=SIM.st; const lv=st.level; const small=s<0.02;
+  // objectives for quests in log
+  const dgAgg=new Map();
+  if(layers.heat) drawHeat();
+  if(layers.objectives){
+    for(const [qid,v] of st.log){ if(v.done&&!v.stickyDone) continue; const col=qColor(qid); const sel=selQuest===qid;
+      for(const ob of objectives(qid)){ const sd=!!(ob.rx&&v.stk?.has(ob.rx)); for(const p of (v.objs&&ob.rx&&v.objs.has(ob.rx)&&!sd)||(v.done&&!ob.rx&&!v.stk?.size)?[]:ob.pts){ if(p.dg){ const k=p.X.toFixed(0)+','+p.Y.toFixed(0); if(!dgAgg.has(k)) dgAgg.set(k,{p,q:new Set()}); dgAgg.get(k).q.add(qid); continue; } const [x,y]=toS(p); if(x<-10||x>W+10||y<-10||y>H+10) continue;
+        const r=(small?2.2:3.6)+(sel?1.4:0); ctx.fillStyle=col; ctx.strokeStyle='#120c04'; ctx.lineWidth=1.3; ctx.beginPath();
+        if(p.kind==='obj'||p.kind==='loot'&&p.ent?.[0]==='o'){ ctx.rect(x-r,y-r,2*r,2*r);} else if(p.kind==='event'){ ctx.moveTo(x,y-r-1);ctx.lineTo(x+r+1,y);ctx.lineTo(x,y+r+1);ctx.lineTo(x-r-1,y);ctx.closePath(); } else ctx.arc(x,y,r,0,7);
+        if(sd) ctx.globalAlpha=.5; ctx.fill(); ctx.stroke(); if(p.kind==='loot'&&!small){ ctx.fillStyle='#120c04'; ctx.beginPath(); ctx.arc(x,y,1.2,0,7); ctx.fill(); } ctx.globalAlpha=1;
+        hits.push({x,y,r:r+3,kind:'obj',qids:[qid],label:p.label,obText:ob.text,obRx:ob.rx,stk:sd||(v.done&&v.stickyDone&&!!v.stk?.size)});
+      } }
+    }
+  }
+  for(const {p,q} of dgAgg.values()){ const [x,y]=toS(p); if(x<-20||x>W+20||y<-20||y>H+20) continue; const bx=x+11, by=y-11; const sel=[...q].includes(selQuest);
+    const t=`${q.size} quest${q.size>1?'s':''} inside`; ctx.font='700 11px "Alegreya Sans", sans-serif'; const tw=ctx.measureText(t).width+12; const lx=x+10, ly=y-22;
+    ctx.fillStyle='#ff8a1f'; ctx.strokeStyle=sel?'#fff':'#2a1200'; ctx.lineWidth=sel?2.5:1.5; ctx.beginPath(); ctx.roundRect(lx,ly,tw,16,4); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(lx+4,ly+16); ctx.lineTo(x+3,y-3); ctx.stroke();
+    ctx.fillStyle='#231200'; ctx.textAlign='left'; ctx.textBaseline='middle'; ctx.fillText(t,lx+6,ly+8.5);
+    hits.push({x:lx+tw/2,y:ly+8,r:Math.max(12,tw/2),kind:'dgobj',qids:[...q],label:dungeonAt(p)}); }
+  // turn-ins
+  const groups=new Map();
+  for(const [qid,v] of st.log){ for(const p of finisherPts(qid).slice(0,3)){ const k=p.ent+'@'+p.X.toFixed(0)+','+p.Y.toFixed(0); if(!groups.has(k)) groups.set(k,{p,t:[],a:[],l:[]}); groups.get(k).t.push(qid); } }
+  for(const [qid,si] of st.stkT||[]){ if(si>cursor||!Q(qid)||st.log.has(qid)) continue; for(const p of finisherPts(qid).slice(0,3)){ const k=p.ent+'@'+p.X.toFixed(0)+','+p.Y.toFixed(0); if(!groups.has(k)) groups.set(k,{p,t:[],a:[],l:[]}); const g=groups.get(k); (g.s=g.s||[]).push(qid); } }
+  if(layers.avail||layers.trivial){
+    for(const a of SIM.avail){ if(!a.ok) continue; const q=Q(a.qid); const triv=diffClass(q.l,lv)==='grey'; if(triv&&!layers.trivial) continue; if(!triv&&!layers.avail) continue;
+      for(const p of starterPts(a.qid).slice(0,3)){ const k=p.ent+'@'+p.X.toFixed(0)+','+p.Y.toFixed(0); if(!groups.has(k)) groups.set(k,{p,t:[],a:[],l:[]}); groups.get(k).a.push(a.qid); } }
+  }
+  if(layers.locked) for(const a of SIM.avail){ if(!a.locked) continue;
+    for(const p of starterPts(a.qid).slice(0,3)){ const k=p.ent+'@'+p.X.toFixed(0)+','+p.Y.toFixed(0); if(!groups.has(k)) groups.set(k,{p,t:[],a:[],l:[]}); groups.get(k).l.push(a); } }
+  for(const g of groups.values()){
+    const [x,y]=toS(g.p); if(x<-20||x>W+20||y<-20||y>H+20) continue;
+    const size=small?13:19; const hasSel=[...g.a,...g.t].includes(selQuest);
+    if(hasSel){ ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(x,y,size*0.8,0,7); ctx.stroke(); }
+    const DGC='#ff8a1f', DGG='#b98a5e';
+    if(g.t.length){ const done=g.t.some(q=>st.log.get(q).done); const dq=g.t.every(isDungeonQuest); qmark(x,y,'?',done?(dq?DGC:'#ffd100'):(dq?DGG:'#b5b5b5'),size); }
+    else if(!g.a.length&&!g.l.length&&g.s){ ctx.globalAlpha=.55; qmark(x,y,'?','#ffd100',size*0.85); ctx.globalAlpha=1; }
+    else if(!g.a.length){ qmark(x,y,'!','#8fb3d9',size*0.8); }
+    else { const allTriv=g.a.every(q=>diffClass(Q(q).l,lv)==='grey'); const allD=g.a.every(isDungeonQuest), anyD=g.a.some(isDungeonQuest);
+      qmark(x,y,'!',allTriv?'#a8a8a8':(allD?DGC:'#ffd100'),size); if(anyD&&!allD&&!allTriv) qmark(x-size*0.5,y-size*0.45,'!',DGC,size*0.6); }
+    if(g.t.length&&g.a.length){ qmark(x+size*0.5,y-size*0.45,'!',g.a.every(isDungeonQuest)?'#ff8a1f':'#ffd100',size*0.6); }
+    hits.push({x,y,r:size*0.7,kind:'quest',avail:g.a,turn:g.t,locked:g.l,stkT:g.s||[],label:g.p.label,npcLoc:g.p});
+  }
+  // selected quest extra: show starter/finisher even if not available
+  if(selQuest && Q(selQuest) && !st.log.has(selQuest) && !SIM.avail.some(a=>a.ok&&a.qid===selQuest)){
+    for(const p of starterPts(selQuest).slice(0,3)){ const [x,y]=toS(p); qmark(x,y,'!','#8a8a8a',18); ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(x,y,15,0,7); ctx.stroke(); hits.push({x,y,r:13,kind:'quest',avail:[],turn:[],sel:[selQuest],label:p.label,npcLoc:p}); }
+  }
+}
+function drawRoute(){
+  const pts=[]; SIM.res.forEach((r,i)=>{ if(r.pt) pts.push({i,p:r.pt,r}); });
+  if(pts.length<1) return;
+  ctx.lineCap='round'; ctx.lineJoin='round';
+  let LC=null; const hexA=(h,a)=>{ const n=parseInt(h.slice(1),16); return `rgba(${n>>16},${n>>8&255},${n&255},${a})`; };
+  const RC=route.char.rcol||null; const walkStyle=f=>{ const c=LC||RC; ctx.strokeStyle=c?hexA(c,f?.5:.95):f?'rgba(255,230,160,.45)':'rgba(255,205,70,.95)'; ctx.lineWidth=f?2:LC?3.5:3; ctx.setLineDash(f?[5,6]:[]); };
+  const poly=arr=>{ ctx.beginPath(); arr.forEach((q,k)=>{ const [x,y]=toS(q); k?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.stroke(); };
+  const walkLeg=(a,b,f)=>{ if(!a||!b) return; const P=legPath(a,b);
+    if(!P){ walkStyle(f); if(P===undefined){ ctx.globalAlpha=.45; ctx.setLineDash([2,6]); } poly([a,b]); ctx.globalAlpha=1; return; }
+    for(const sg of P.segs){ if(sg.k==='ship'){ ctx.strokeStyle=f?'rgba(120,200,255,.45)':'rgba(120,200,255,.95)'; ctx.lineWidth=2; ctx.setLineDash([3,5]); poly(sg.pts); } else { walkStyle(f); poly(sg.pts); } } };
+  const lp=pts.filter(x=>!x.r.stk);
+  pathHits=[]; SIM.res.forEach((r,i)=>{ if(!r.path||r.path.length<2) return; const f=i>cursor, ed=pathEdit===i; const P=r.path.map(toS);
+    ctx.strokeStyle=ed?'rgba(120,255,160,.95)':f?'rgba(140,230,170,.4)':'rgba(120,235,160,.85)'; ctx.lineWidth=ed?2.5:1.8; ctx.setLineDash(ed?[]:[6,4]); ctx.beginPath(); P.forEach(([x,y],k)=>k?ctx.lineTo(x,y):ctx.moveTo(x,y)); ctx.closePath(); ctx.stroke(); ctx.setLineDash([]);
+    P.forEach(([x,y],k)=>{ ctx.fillStyle=ed?'#fff':ctx.strokeStyle; ctx.beginPath(); ctx.arc(x,y,ed?6:2.5,0,7); ctx.fill(); if(ed){ ctx.strokeStyle='#1b6b3a'; ctx.lineWidth=2; ctx.stroke(); ctx.fillStyle='#1b6b3a'; ctx.font='700 9px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(String(k+1),x,y+.5); ctx.strokeStyle='rgba(120,255,160,.95)'; } });
+    if(ed) pathHits=P.map(([x,y],k)=>({x,y,k})); });
+  for(const {i,p,r} of pts) if(r.stk){ const [x,y]=toS(p); ctx.strokeStyle=i>cursor?'rgba(255,230,160,.45)':'rgba(255,205,70,.9)'; ctx.lineWidth=1.5; ctx.setLineDash([2,3]); ctx.beginPath(); ctx.arc(x,y,9,0,7); ctx.stroke(); ctx.setLineDash([]); }
+  for(let k=1;k<lp.length;k++){ const {i,p,r}=lp[k]; const prev=lp[k-1].p; const f=i>cursor; const lt=r.leg?.type; const sc=secOf(i); LC=sc?.color||null; if(sc?.hide) continue; ctx.globalAlpha=1;
+    if(lt==='hs') continue;
+    if(lt==='death'&&r.dep){ walkLeg(prev,r.dep,f); const [ax,ay]=toS(r.dep),[bx,by]=toS(p); ctx.strokeStyle=f?'rgba(200,170,255,.45)':'rgba(200,170,255,.95)'; ctx.lineWidth=2; ctx.setLineDash([2,5]); ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(bx,by); ctx.stroke(); ctx.setLineDash([]); ctx.font='13px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillStyle='#e9dcff'; ctx.fillText('☠',ax,ay); continue; }
+    if(lt==='fly'){ if(r.dep) walkLeg(prev,r.dep,f); drawFlight(r,f); continue; }
+    if(lt==='ride'&&r.dep){ walkLeg(prev,r.dep,f); const [ax,ay]=toS(r.dep),[bx,by]=toS(p); const dx=bx-ax,dy=by-ay; ctx.strokeStyle=f?'rgba(120,200,255,.45)':'rgba(120,200,255,.95)'; ctx.lineWidth=2.5; ctx.setLineDash([3,5]); ctx.beginPath(); ctx.moveTo(ax,ay); ctx.quadraticCurveTo((ax+bx)/2-dy*0.1,(ay+by)/2+dx*0.1,bx,by); ctx.stroke(); ctx.setLineDash([]); continue; }
+    walkLeg(prev,p,f); }
+  ctx.setLineDash([]); ctx.globalAlpha=1; LC=null;
+  if(view.s>0.05){ let last=null;
+    for(const {i,p} of pts){ const sc=secOf(i); if(sc?.hide) continue; const [x,y]=toS(p); if(last&&Math.hypot(x-last[0],y-last[1])<18) continue; last=[x,y];
+      const cur=i===cursor; ctx.fillStyle=cur?'#ffd100':'#2a1c08'; ctx.strokeStyle=cur?'#2a1c08':(sc?.color||route.char.rcol||'#ffd100'); ctx.lineWidth=1.5; ctx.beginPath(); ctx.arc(x+13,y+11,8,0,7); ctx.fill(); ctx.stroke();
+      ctx.fillStyle=cur?'#2a1c08':'#ffe9a8'; ctx.font='700 10px "Alegreya Sans", sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(String(i+1),x+13,y+11.5);
+      hits.push({x:x+13,y:y+11,r:8,kind:'route',step:i});
+    }
+  }
+}
+/* pointer interaction */
+const ptrs=new Map(); let dragStart=null, moved=false, pinch=null, picking=null;
+canvas.addEventListener('pointerdown',e=>{ if(pathEdit!=null&&e.button===0){ const h=pathHits.find(h=>Math.hypot(h.x-e.offsetX,h.y-e.offsetY)<10); if(h){ canvas.setPointerCapture(e.pointerId); pathDrag={k:h.k,moved:false}; e.preventDefault(); return; } }
+  canvas.setPointerCapture(e.pointerId); ptrs.set(e.pointerId,{x:e.offsetX,y:e.offsetY}); moved=false; dragStart={x:e.offsetX,y:e.offsetY,tx:view.tx,ty:view.ty};
+  if(ptrs.size===2){ const [a,b]=[...ptrs.values()]; pinch={d:Math.hypot(a.x-b.x,a.y-b.y),s:view.s}; } hidePop(); });
+canvas.addEventListener('pointermove',e=>{
+  if(pathDrag){ const s=route.steps[pathEdit]; const r=SIM.res[pathEdit]; if(!pathDrag.moved){ pushHistory(); pathDrag.moved=true; if(!s.path){ s.path=pathOf(s).map(l=>({...l})); } delete s.loopRaw; s.pathSrc='edited'; }
+    const X=(e.offsetX-view.tx)/view.s, Y=(e.offsetY-view.ty)/view.s; const z=s.path[pathDrag.k].z; s.path[pathDrag.k]=planeToZp(z,X,Y); if(r.path) r.path[pathDrag.k]={...r.path[pathDrag.k],X,Y}; requestDraw(); return; }
+  if(ptrs.has(e.pointerId)){ ptrs.set(e.pointerId,{x:e.offsetX,y:e.offsetY});
+    if(ptrs.size===2&&pinch){ const [a,b]=[...ptrs.values()]; const d=Math.hypot(a.x-b.x,a.y-b.y); zoomAt((pinch.s*d/pinch.d)/view.s,(a.x+b.x)/2,(a.y+b.y)/2); moved=true; return; }
+    const dx=e.offsetX-dragStart.x, dy=e.offsetY-dragStart.y; if(Math.abs(dx)+Math.abs(dy)>4) moved=true;
+    if(moved){ canvas.classList.add('dragging'); view.tx=dragStart.tx+dx; view.ty=dragStart.ty+dy; requestDraw(); } $('#tip').style.display='none'; return; }
+  hover(e.offsetX,e.offsetY);
+});
+function endPtr(e){ if(pathDrag){ const m=pathDrag.moved; pathDrag=null; if(m) refresh(); return; } ptrs.delete(e.pointerId); if(ptrs.size<2) pinch=null; canvas.classList.remove('dragging');
+  if(!moved && e.type==='pointerup') click(e.offsetX,e.offsetY); }
+canvas.addEventListener('pointerup',endPtr); canvas.addEventListener('pointercancel',endPtr);
+canvas.addEventListener('contextmenu',e=>{ if(pathEdit==null) return; const h=pathHits.find(h=>Math.hypot(h.x-e.offsetX,h.y-e.offsetY)<10); if(!h) return; e.preventDefault(); pathDelPt(h.k); });
+canvas.addEventListener('pointerleave',()=>{$('#tip').style.display='none';});
+canvas.addEventListener('wheel',e=>{ e.preventDefault(); zoomAt(Math.exp(-e.deltaY*(e.deltaMode?0.05:0.0016)),e.offsetX,e.offsetY); },{passive:false});
+canvas.addEventListener('keydown',e=>{ const k=e.key; if(k==='+'||k==='=') zoomAt(1.3,W/2,H/2); else if(k==='-') zoomAt(1/1.3,W/2,H/2); else if(k.startsWith('Arrow')){ const d=60; if(k==='ArrowLeft')view.tx+=d; if(k==='ArrowRight')view.tx-=d; if(k==='ArrowUp')view.ty+=d; if(k==='ArrowDown')view.ty-=d; requestDraw(); } else return; e.preventDefault(); });
+const HIT_PRI={fq:0,dgobj:0,quest:0,obj:1,route:1,ghost:2,fp:3,dungeon:3,town:4};
+/* ---------- grinding heatmap: XP per time-to-kill of the hostile non-elite mobs in each 150-yd cell ---------- */
+let HEAT=null;
+function heatCells(){ const L=SIM.st.level, party=Math.max(1,SIM.st.party||1); const key=L+':'+party; if(HEAT&&HEAT.key===key) return HEAT; const G=META.mobl?.g||{}, C=+(META.mobl?.c||150); const out=[];
+  for(const k in G){ let num=0,cnt=0,best=null,mg=0; const mobs=[]; for(const [lv,hp,n,arm,uc,nid] of G[k]){ const ml=Math.round(lv); if(ml>L+5||!hp) continue; const xp=mobXP(L,ml,false,party); if(!xp) continue;
+      const A=arm>=0?arm:45*ml, dr=Math.min(.75,A/(A+400+85*L)); /* armor from CMaNGOS classic-db (else estimated from level); hunter damage is physical */
+      let rate=xp*(1-dr)/hp; if(ml>=L+3) rate*=.6; /* orange/red: slower, riskier pulls */ rate*=Math.min(1,n/4); /* 4+ spawns of a mob in the square = fully grindable */ cnt+=n; const m={lv,hp,xp,rate,A,uc,nid,n}; mobs.push(m); if(!best||rate>best.rate) best=m; if(uc===8) mg+=n; }
+    if(!cnt) continue; const [cx,cy]=k.split(',').map(Number); out.push({X:(cx+.5)*C,Y:(cy+.5)*C,v:best?best.rate:0,cnt,best,mg,mobs:mobs.sort((a,b)=>b.rate-a.rate),all:G[k]}); }
+  const vs=out.map(o=>o.v).sort((a,b)=>a-b); const ref=vs[Math.floor(vs.length*.98)]||1; for(const o of out) o.h=Math.min(1,o.v/ref);
+  return HEAT={key,cells:out,C}; }
+function drawHeat(){ const HC=heatCells(), sz=HC.C*view.s, H_=H; if(sz<1.2) return; for(const o of HC.cells){ if(o.h<.08) continue; const [x,y]=toS(o); if(x<-sz||y<-sz||x>W+sz||y>H_+sz) continue;
+    const h=o.h, r=255, g=Math.round(230-200*h), b=Math.round(60-60*h); ctx.fillStyle=`rgba(${r},${g},${b},${(.12+.5*h).toFixed(2)})`; ctx.fillRect(x-sz/2,y-sz/2,sz+.5,sz+.5); } }
+const UCN={1:'warrior',2:'paladin',8:'mage'};
+function heatPop(c,x,y){ const top=c.mobs[0]?.rate||1, mobN=id=>META.mobl?.n?.[id]||('NPC '+id);
+  const zz=plane2zone(c.X,c.Y); const loc=zz?{z:zz.z,px:+zz.px.toFixed(1),py:+zz.py.toFixed(1)}:null;
+  let html=`<h4>Grinding here · ${Math.round(c.h*100)}% heat</h4><div class="note">${zz?esc(zoneName(zz.z))+' '+zz.px.toFixed(0)+', '+zz.py.toFixed(0)+' · ':''}at level ${SIM.st.level} · best first (XP ÷ time to kill)</div>`;
+  html+=c.mobs.map(m=>`<div class="it"><b>${esc(mobN(m.nid))}</b> <span class="note">lvl ${m.lv%1?Math.floor(m.lv)+'–'+Math.ceil(m.lv):m.lv} ${UCN[m.uc]||''} · ${m.n} here</span><div class="note">${fmt(m.hp)} HP · ${fmt(m.A)} armor · ≈${fmt(m.xp)} XP each · ${Math.round(m.rate/top*100)}%</div><div class="row"><button class="btn sm gold" data-hgrind="${m.nid}">Grind these…</button><a class="btn sm" href="https://www.wowhead.com/classic/npc=${m.nid}" target="_blank" rel="noopener">Wowhead</a></div></div>`).join('');
+  const skipped=c.all.filter(a=>!c.mobs.some(m=>m.nid===a[5])); if(skipped.length) html+=`<div class="note">Not worth it at your level: ${skipped.map(a=>esc(mobN(a[5]))+' ('+a[0]+')').join(', ')}</div>`;
+  showPop({kind:'heat',html},x,y); HEATSEL={c,loc}; }
+let HEATSEL=null;
+function heatAt(x,y){ if(!HEAT) return null; const X=(x-view.tx)/view.s, Y=(y-view.ty)/view.s; const k=Math.floor(X/HEAT.C)+','+Math.floor(Y/HEAT.C); return HEAT.cells.find(o=>Math.floor(o.X/HEAT.C)+','+Math.floor(o.Y/HEAT.C)===k)||null; }
+function hitAt(x,y){ let best=null,bd=1e9; for(const h of hits){ const d=Math.hypot(h.x-x,h.y-y); if(d>h.r+3) continue; const s=d+(HIT_PRI[h.kind]??3)*4; if(s<bd){ bd=s; best=h; } } return best; }
+function dungeonAt(p){ let best='Dungeon',bd=1e12; for(const d of Object.values(META.dungeons)) for(const [z,x0,y0] of d.l){ const t=zp2plane(z,x0,y0); if(!t) continue; const dd=(t.X-p.X)**2+(t.Y-p.Y)**2; if(dd<bd){bd=dd;best=d.n;} } return best; }
+function hover(x,y){
+  const tip=$('#tip'); const h=picking?null:hitAt(x,y);
+  let html='';
+  if(!h){ const c=layers.heat&&!picking?heatAt(x,y):null; if(!c||c.h<.08){ tip.style.display='none'; canvas.style.cursor=picking?'crosshair':''; return; }
+    canvas.style.cursor=''; html=`<b>Grinding: ${Math.round(c.h*100)}% heat</b><div>${c.cnt} mob spawns here${c.mg?` (${c.mg} caster/mage-type)`:''}</div><div>Best: level ${c.best.lv} ${({1:'warrior-type',2:'paladin-type',8:'mage-type'})[c.best.uc]||''} · ${fmt(c.best.hp)} HP · ${fmt(c.best.A)} armor · ≈${fmt(c.best.xp)} XP each</div><div style="opacity:.75">At your level ${SIM.st.level}. XP ÷ time to kill (HP and armor vs physical damage). Mob stats: CMaNGOS classic-db.</div>`; }
+  else { canvas.style.cursor='pointer'; }
+  if(h){
+  if(h.kind==='quest'){ html=`<b>${esc(h.label)}</b>`; for(const q of h.turn) html+=`<div>? ${esc(Q(q).n)}</div>`; for(const q of h.avail) html+=`<div>! [${Q(q).l}] ${esc(Q(q).n)}${isDungeonQuest(q)?' <span style="color:#ff9a3c">(dungeon)</span>':''}</div>`; for(const q of h.sel||[]) html+=`<div>[${Q(q).l}] ${esc(Q(q).n)} (not available)</div>`; for(const a of h.locked||[]) html+=`<div>🔒 [${Q(a.qid).l}] ${esc(Q(a.qid).n)} <span style="opacity:.75">needs ${esc(a.roots.map(r=>Q(r).n).join(', '))}</span></div>`; }
+  else if(h.kind==='obj') html=`<b>${esc(Q(h.qids[0]).n)}</b><div>${esc(h.obText)}</div><div style="opacity:.75">${esc(h.label||'')}</div>`;
+  else if(h.kind==='dgobj') html=`<b>${esc(h.label)}</b><div>Objectives inside for:</div>${h.qids.map(q=>`<div>· ${esc(Q(q).n)}</div>`).join('')}`;
+  else if(h.kind==='ghost'){ const g=G(h.g); const r=GH.get(h.g).res[h.i]; html=`<b>${esc(g.name)} · step ${h.i+1}</b><div>${esc(rxpPlain(ghostText(g.steps[h.i])))}</div><div style="opacity:.8">${esc(STLBL[r.status]||'')}${r.why?': '+esc(r.why):''}</div>`; }
+  else if(h.kind==='route') html=`Step ${h.step+1}: ${esc(rxpPlain(stepText(route.steps[h.step]).t))}`;
+  else html=`<b>${esc(h.label)}</b>`; }
+  tip.innerHTML=html; tip.style.display='block';
+  const tw=tip.offsetWidth; tip.style.left=Math.min(W-tw-8,x+14)+'px'; tip.style.top=(y+14)+'px';
+}
+function click(x,y){ if(pathEdit!=null&&pathClick(x,y)) return;
+  return click0(x,y); }
+function click0(x,y){
+  if(picking){ const X=(x-view.tx)/view.s, Y=(y-view.ty)/view.s; const z=plane2zone(X,Y); if(!z){ toast('That spot is outside every zone'); return; } const cb=picking; stopPick(); cb({z:z.z,px:z.px,py:z.py}); return; }
+  const h=hitAt(x,y); if(!h){ hidePop(); const c=layers.heat?heatAt(x,y):null; if(c&&c.h>=.08) heatPop(c,x,y); return; }
+  if(h.kind==='route'){ setCursor(h.step); const under=hits.filter(t=>t.kind!=='route'&&Math.hypot(t.x-x,t.y-y)<=t.r+6).sort((a,b)=>((HIT_PRI[a.kind]??3)-(HIT_PRI[b.kind]??3))||(Math.hypot(a.x-x,a.y-y)-Math.hypot(b.x-x,b.y-y)))[0]; if(under) showPop(under,x,y); return; }
+  showPop(h,x,y);
+}
+
+/* ---------- steps ---------- */
+function stepText(s){
+  const q=s.q?Q(s.q):null; const qn=q?q.n:(s.qn||('Quest '+s.q));
+  switch(s.t){
+    case 'accept': return {ic:'!',cls:'accept',t:'Accept '+qn,sub:s.shared?'Shared by a party member':isItemStart(s.q)&&!s.src?'Farm '+Q(s.q).s.i.map(i=>DB.i[i]?.n||'item').join(', ')+' (starts the quest) · '+locSub(s):(q?locSub(s):'')+(s.src?' · from guide':'')};
+    case 'complete': { if(!q&&s.objText) return {ic:'✓',cls:'complete',t:`${qn}: ${s.objText}`,sub:s.tgt?'Talk to '+s.tgt:'One objective'}; const ob=s.obj&&q?objectives(s.q).find(o=>o.rx===s.obj):null; return {ic:'✓',cls:'complete',t:ob?`${qn}: ${ob.text}${s.upto>0?` (up to ${s.upto})`:''}`:'Complete '+qn,sub:ob?'One objective':(q?objectives(s.q).map(o=>o.text).join('; '):'')}; }
+    case 'turnin': return {ic:'?',cls:'turnin',t:'Turn in '+qn,sub:q?locSub(s):''};
+    case 'abandon': return {ic:'×',cls:'abandon',t:'Abandon '+qn,sub:''};
+    case 'prof': { if(s.act==='craft') return {ic:'⚒',cls:'travel',t:`Craft ${s.n>1?s.n+' × ':''}${s.item}`,sub:s.prof}; const t=ptrainerOf(s.npc); return {ic:'⚒',cls:'travel',t:s.act==='learn'?`Learn ${s.prof}`:`Train ${s.prof}`,sub:(t?.name||s.npcName||'')+(t?' · '+t.sub+' · '+zoneName(t.sp[0][0]):'')}; }
+    case 'deathskip': { const g=gyAt(s.gy), r=SIM?.res[route.steps.indexOf(s)]; const d=r?.dep?withZone(r.dep):null; return {ic:'☠',cls:'travel',t:'Die and res at the Spirit Healer',sub:(g?zoneName(g.z)+' graveyard':'')+(d&&d.z!=null?` · die around ${zoneName(d.z)} ${d.px.toFixed(0)}, ${d.py.toFixed(0)}`:'')+' · res sickness from level 11'}; }
+    case 'collect': { const src=[...new Set(itemSourcePts(s.item,'loot').map(p=>p.label))].slice(0,2).join(', '); return {ic:'✚',cls:'complete',t:`Loot ${DB.i[s.item]?.n||'item'}${s.c>1?' ×'+s.c:''}`,sub:(src?'from '+src+' · ':'')+'needed for '+(Q(s.q)?.n||'quest')}; }
+    case 'train': { const t=trainerOf(s.npc); return {ic:'✦',cls:'travel',t:'Train class spells',sub:(t?.name||s.npcName||'class trainer')+(t?' · '+zoneName(t.sp[0][0]):'')}; }
+    case 'buy': { const v=vendorOf(s.npc); return {ic:'¤',cls:'travel',t:'Buy from '+(v?.name||s.npcName||'vendor'),sub:(s.items||[]).map(it=>`${it.c}× ${it.n||itemName(it.id)}`).join(', ')+(v?.sub?' · '+v.sub:'')}; }
+    case 'grind': if(s.mode==='by'){ const j=route.steps.findIndex(x=>x.id===s.at); const t=s._tgt?fromTotal(s._tgt):null; return {ic:'⚔',cls:'grind',t:`Grind to level ${t?t.level+' + '+fmt(t.xp)+' XP':'?'} (level ${s.level}${s.xp?' + '+fmt(s.xp)+' XP':''} after step ${j+1})`,sub:[s.note,j>=0?'ding at: '+rxpPlain(stepText(route.steps[j]).t):''].filter(Boolean).join(' · ')}; }
+      return {ic:'⚔',cls:'grind',t:s.mode==='to'?`Grind to level ${s.level}${s.xp?' + '+fmt(s.xp)+' XP':''}`:`Grind ${fmt(s.amount||0)} XP`,sub:[s.note,{mobs:'Mob kills',explore:'Exploration',both:'Mobs and exploration',other:''}[s.src]||''].filter(Boolean).join(' · ')};
+    case 'party': return {ic:s.size>1?String(s.size):'1',cls:'party',t:s.size>1?`Group up: ${s.size} players`:'Go solo',sub:'Affects mob-kill XP estimates from here on'};
+    case 'custom': return {ic:'★',cls:'custom',t:({turnin:'Turn in ',accept:'Accept ',complete:'Complete '})[s.act||'turnin']+s.name,sub:(s.qid?'ID '+s.qid+' · ':'')+'custom quest'};
+    case 'travel': { const r=SIM?.res[route.steps.indexOf(s)];
+      if(s.kind==='fly'&&r?.dest) return {ic:'✈',cls:'travel',t:'Fly to '+taxiShort(r.dest),sub:(r.depNode?'from '+taxiShort(r.depNode):'')+(r.flight?.secs?' · '+fmtSecs(r.flight.secs):'')+(r.flight&&r.flight.nodes.length>2?' · via '+r.flight.nodes.slice(1,-1).map(taxiShort).join(', '):'')};
+      if(s.kind==='fp'&&r?.node) return {ic:'✈',cls:'travel',t:'Get flight path: '+taxiShort(r.node),sub:r.pt?.label||''};
+      if(s.kind==='ride'&&r?.ride) return {ic:r.ride.kind==='boat'?'⛵':r.ride.kind==='Zeppelin'?'◉':'⇆',cls:'travel',t:r.ride.text,sub:'from '+r.ride.dock};
+      if(s.kind==='hs') return {ic:'⌂',cls:'travel',t:'Hearth to '+(r?.pt?.label||rxpPlain(s.text||'')),sub:''};
+      return {ic:'➤',cls:'travel',t:(s.src&&!s.src.auto&&(s.kind==='goto'||s.kind==='note')?'':({fly:'Fly to ',fp:'Get flight path: ',home:'Set hearthstone: ',hs:'Hearth to ',goto:'Go to ',note:''})[s.kind])+(s.text||''),sub:s.loc?zoneName(s.loc.z)+' '+s.loc.px+', '+s.loc.py:''}; }
+  }
+  return {ic:'·',cls:'',t:'Step',sub:''};
+}
+function locSub(s){ const p=SIM?.res[route.steps.indexOf(s)]?.pt; if(!p) return ''; return (p.label?p.label+' · ':'')+zoneName(p.z)+' '+(+p.px).toFixed(1)+', '+(+p.py).toFixed(1); }
+let history=[], future=[];
+function pushHistory(){ history.push(JSON.stringify({steps:route.steps,cursor})); if(history.length>100) history.shift(); future=[]; }
+function undo(){ selSteps.clear(); const h=history.pop(); if(!h) return toast('Nothing to undo'); future.push(JSON.stringify({steps:route.steps,cursor})); const o=JSON.parse(h); route.steps=o.steps; cursor=o.cursor; refresh(); }
+// sticky / completewith: guide steps carry it from RestedXP; your own steps use s.stk = 'next' | 'sticky'
+function stepGuide(s){ return s.src&&!s.src.auto&&typeof G==='function'?G(s.src.g)?.steps[s.src.i]:null; }
+function isSticky(s){ const gs=stepGuide(s); return gs?!!(gs.sticky||gs.cw):!!s.stk; }
+function guideStickyDefault(t,q){ for(const g of route.guides||[]) for(const x of g.steps||[]) if(x.q===q&&x.t===t&&x.cond&&(x.sticky||x.cw)) return {stk:x.cw==='next'?'next':'sticky',g:g.name}; return null; }
+/* ---------- objective paths (#loop): the arrow walks you round the spawns ---------- */
+function planeToZp(z,X,Y){ const Z=META.zones[z]; const [L,R,T,B]=Z.b; const off=META.off[Z.m]; const wy=-(X-off[0]), wx=-(Y-off[1]); return {z:+z,px:+((L-wy)/(L-R)*100).toFixed(2),py:+((T-wx)/(T-B)*100).toFixed(2)}; }
+function pathOf(s){ return s.path!==undefined?s.path:(stepGuide(s)?.path||null); }
+function pathPts(path){ return (path||[]).map(l=>zp2plane(l.z,l.px,l.py)).filter(Boolean); }
+function guidePathFor(q,obj){ for(const g of route.guides||[]) for(const x of g.steps||[]) if(x.q===q&&x.t==='complete'&&x.cond&&x.path&&x.path.length>=2&&!(obj&&x.objs&&!x.objs.some(o=>o.n===obj))) return {path:x.path.map(l=>({...l})),raw:x.loopRaw?[...x.loopRaw]:null,g:g.name}; return null; }
+function genPath(qid,obj,ref){
+  if(!(obj&&obj.pts)&&!Q(qid)) return null; const obs=obj&&obj.pts?[obj]:obj==='item'?[{pts:Q(qid).s.i.flatMap(i=>itemSourcePts(i,'loot'))}]:objectives(qid).filter(o=>!o.pre&&(!obj||o.rx===obj)&&['kill','loot','obj'].includes(o.kind));
+  let pts=obs.flatMap(o=>o.pts).filter(p=>p&&!p.dg&&p.z!=null); if(pts.length<4) return null;
+  const cl=new Map(); for(const p of pts){ const k=Math.round(p.X/300)+','+Math.round(p.Y/300); if(!cl.has(k)) cl.set(k,[]); cl.get(k).push(p); }
+  let best=null,bs=-1e18; for(const g of cl.values()){ const mx=g.reduce((a,p)=>a+p.X,0)/g.length, my=g.reduce((a,p)=>a+p.Y,0)/g.length; const d=ref?Math.hypot(mx-ref.X,my-ref.Y):0; const sc=g.length*400-d; if(sc>bs){ bs=sc; best={mx,my}; } }
+  const sel=pts.filter(p=>Math.hypot(p.X-best.mx,p.Y-best.my)<=420); if(sel.length<4) return null;
+  const cells=new Map(); for(const p of sel){ const k=Math.floor(p.X/70)+','+Math.floor(p.Y/70); if(!cells.has(k)) cells.set(k,[]); cells.get(k).push(p); }
+  let W=[...cells.values()].map(g=>({X:g.reduce((a,p)=>a+p.X,0)/g.length,Y:g.reduce((a,p)=>a+p.Y,0)/g.length,n:g.length}));
+  if(W.length>10){ let C=[...W].sort((a,b)=>b.n-a.n).slice(0,10).map(w=>({X:w.X,Y:w.Y}));
+    for(let it=0;it<10;it++){ const acc=C.map(()=>({X:0,Y:0,n:0})); for(const p of sel){ let bi=0,bd=1e18; C.forEach((c,k)=>{ const d=(c.X-p.X)**2+(c.Y-p.Y)**2; if(d<bd){bd=d;bi=k;} }); acc[bi].X+=p.X; acc[bi].Y+=p.Y; acc[bi].n++; } C=acc.filter(a=>a.n).map(a=>({X:a.X/a.n,Y:a.Y/a.n,n:a.n})); }
+    W=C; }
+  if(W.length<3) return null;
+  // tour: nearest neighbour from the point closest to where you arrive, then 2-opt on the closed loop
+  let start=0; if(ref){ let bd=1e18; W.forEach((w,k)=>{ const d=Math.hypot(w.X-ref.X,w.Y-ref.Y); if(d<bd){bd=d;start=k;} }); }
+  const left=new Set(W.keys()); left.delete(start); const T=[start]; while(left.size){ const a=W[T[T.length-1]]; let bk=-1,bd=1e18; for(const k of left){ const d=Math.hypot(W[k].X-a.X,W[k].Y-a.Y); if(d<bd){bd=d;bk=k;} } T.push(bk); left.delete(bk); }
+  const D=(a,b)=>Math.hypot(W[a].X-W[b].X,W[a].Y-W[b].Y); let imp=true, guard=0;
+  while(imp&&guard++<50){ imp=false; for(let a=1;a<T.length-1;a++) for(let b=a+1;b<T.length;b++){ const p=T[a-1],q=T[a],r=T[b],t=T[(b+1)%T.length]; if(D(p,r)+D(q,t)<D(p,q)+D(r,t)-0.01){ T.splice(a,b-a+1,...T.slice(a,b+1).reverse()); imp=true; } } }
+  return T.map(k=>{ const w=W[k]; let bz=sel[0], bd=1e18; for(const p of sel){ const d=(p.X-w.X)**2+(p.Y-w.Y)**2; if(d<bd){bd=d;bz=p;} } return planeToZp(bz.z,w.X,w.Y); });
+}
+function routeRefBefore(i){ for(let k=Math.min(i,route.steps.length)-1;k>=0;k--) if(SIM.res[k]?.pt&&!SIM.res[k].stk) return SIM.res[k].pt; return null; }
+function defaultPath(step,at){ if(!step.src&&step.t==='accept'&&!step.shared&&!step.path&&isItemStart(step.q)){ const p=genPath(step.q,'item',routeRefBefore(at)); if(p){ step.path=p; step.pathSrc='generated'; return 'gen'; } return null; }
+  if(step.src||step.t!=='complete'||!step.q||step.path) return null; const gp=guidePathFor(step.q,step.obj); if(gp){ step.path=gp.path; if(gp.raw) step.loopRaw=gp.raw; step.pathSrc=gp.g; return 'guide'; }
+  const p=genPath(step.q,step.obj,routeRefBefore(at)); if(p){ step.path=p; step.pathSrc='generated'; return 'gen'; } return null; }
+function preLootSteps(step){ const q=step.q&&Q(step.q); if(!q||step.t!=='complete'||!q.rs||step.src) return [];
+  const have=new Set(route.steps.slice(0,cursor+1).filter(x=>x.t==='collect'&&x.q===step.q).map(x=>x.item)); const o=q.o||{};
+  return q.rs.filter(i=>!have.has(i)&&!(o.i||[]).some(([j])=>j===i)&&itemSourcePts(i,'loot').length).map(i=>({t:'collect',item:i,c:1,q:step.q})); }
+/* ---------- auto sticky: generic objectives (kill N mobs, loot, use objects) are done on the way from accept to hand-in ---------- */
+function objGeneric(o){ if(o.pre||o.extra||!o.rx) return false; if(o.kind==='event'||o.kind==='rep') return false;
+  if(o.kind==='kill'){ if(o.id!=null){ if(isUniqueMob(o.id)) return false; /* one named mob */ } if(/^(speak|talk|report)\b/i.test(o.text||'')) return false; return o.pts.length>1; }
+  if(o.kind==='obj') return o.pts.length>1; /* a single object = a specific spot */
+  if(o.kind==='loot'){ const it=DB.i[o.id]; const src=it?.d||[]; if(src.length&&src.every(n=>isUniqueMob(n))) return false; return o.pts.length>1; }
+  return false; }
+const autoStk=()=>route.char.autoStk!==false;
+function autoStickyAfterAccept(qid){ if(!autoStk()||!Q(qid)) return; const obs=objectives(qid).filter(o=>o.rx&&!o.pre&&!o.extra); const gen=obs.filter(objGeneric); if(!gen.length) return;
+  if(route.steps.some((x,k)=>k>cursor&&x.t==='complete'&&x.q===qid)) return;
+  const add=gen.length===obs.length?[{t:'complete',q:qid,stk:'sticky',auto:1}]:gen.map(o=>({t:'complete',q:qid,obj:o.rx,stk:'sticky',auto:1}));
+  for(const st of add){ defaultPath(st,cursor+1); st.id=uid(); { const pv=route.steps[cursor]; if(pv?.sec) st.sec=pv.sec; } route.steps.splice(cursor+1,0,st); cursor++; }
+  return add.length; }
+function finalBeforeTurnin(qid){ if(!autoStk()||!Q(qid)||!hasObjectives(qid)) return 0; let a=-1; for(let k=cursor;k>=0;k--){ const x=route.steps[k]; if(x.q===qid&&x.t==='accept'){ a=k; break; } } if(a<0) return 0;
+  const nums=objectives(qid).filter(o=>o.rx&&!o.pre&&!o.extra).map(o=>o.rx); if(!nums.length) return 0; const cov=new Set();
+  for(let k=a+1;k<=cursor;k++){ const x=route.steps[k]; if(x.t!=='complete'||x.q!==qid||isSticky(x)||SIM.res[k]?.inactive) continue; if(x.obj&&!(x.upto>0)) cov.add(x.obj); else if(!x.obj) nums.forEach(n=>cov.add(n)); }
+  const miss=nums.filter(n=>!cov.has(n)); if(!miss.length) return 0;
+  const add=miss.length===nums.length?[{t:'complete',q:qid,stk:false,auto:1}]:miss.map(n=>({t:'complete',q:qid,obj:n,stk:false,auto:1}));
+  for(const st of add){ defaultPath(st,cursor+1); st.id=uid(); { const pv=route.steps[cursor]; if(pv?.sec) st.sec=pv.sec; } route.steps.splice(cursor+1,0,st); cursor++; } return add.length; }
+function addStep(step){
+  // quests whose extra kills are spread out (e.g. The Ashenvale Hunt): one step per mob, nearest first
+  if(step.t==='complete'&&!step.src&&!step.obj&&Q(step.q)?.xk){ const obs=objectives(step.q).filter(o=>o.extra); let ref=routeRefBefore(cursor+1); const left=[...obs], order=[];
+    while(left.length){ let bi=0,bd=1e18; left.forEach((o,k)=>{ const p=o.pts[0]; const d=ref&&p?Math.hypot(p.X-ref.X,p.Y-ref.Y):k; if(d<bd){bd=d;bi=k;} }); const o=left.splice(bi,1)[0]; order.push(o); ref=o.pts[0]||ref; }
+    pushHistory(); for(const o of order){ route.steps.splice(cursor+1,0,{t:'complete',q:step.q,obj:o.rx}); cursor++; } refresh(); scrollCursor(); toast(`Added ${order.length} kill steps: ${order.map(o=>o.text.replace(/ slain$/,'')).join(', ')}`); return; }
+  const pre=preLootSteps(step); if(pre.length){ pushHistory(); route.steps.splice(cursor+1,0,...pre); cursor+=pre.length; toast(`Added a step to loot ${pre.map(x=>DB.i[x.item]?.n).join(', ')} first: the objective needs it.`,4500); }
+  const pk=defaultPath(step,cursor+1); const msgs=[]; if(pk) msgs.push(pk==='guide'?`Path copied from ${step.pathSrc}.`:`Rough path generated through the spawns (${step.path.length} points): click 🔁 on the step to adjust it.`);
+  let d=null; if(!step.src&&step.q&&['accept','complete'].includes(step.t)&&step.stk===undefined){ d=guideStickyDefault(step.t,step.q); if(d) step.stk=d.stk; }
+  if(d) msgs.push(`Made sticky (${d.stk==='next'?'done with the next step':'stays on screen until done'}) as in ${d.g}: click 📌 to change.`);
+  if(msgs.length) setTimeout(()=>toast(msgs.join(' '),5000),0);
+  pushHistory(); let autoN=0; if(!step.src&&step.t==='turnin'&&step.q) autoN=finalBeforeTurnin(step.q); const ins0=cursor+1-autoN;
+  { const pv=route.steps[cursor]; if(pv?.sec&&step.sec===undefined) step.sec=pv.sec; /* a new step joins the section of the step it is added after */ } route.steps.splice(cursor+1,0,step); cursor++;
+  if(!step.src&&step.t==='accept'&&step.q&&!step.shared) { const n=autoStickyAfterAccept(step.q); if(n) setTimeout(()=>toast(`Objectives added as sticky (done on the way). A final "complete" step is added before the hand-in if you don't place one.`,4500),0); }
+  if(autoN) setTimeout(()=>toast(`Added a final "complete" step before the hand-in: the sticky objectives must be finished by here.`,4500),0);
+  if(route.group&&store.pathSync?.[route.group]){ const others=pathSet().filter(r=>r!==route); const st=route.steps.slice(ins0,cursor+1); const prev=route.steps[ins0-1]||null; if(others.length&&copyToPaths(st,prev,others)) setTimeout(()=>toast(`Also added to ${others.map(r=>r.name).join(', ')}.`,3000),0); } refresh(); scrollCursor(); }
+function markRemoved(st){ if(!st?.src||st.src.auto) return; const g=G(st.src.g); if(!g) return; g.removed=g.removed||[]; if(!g.removed.includes(st.src.i)) g.removed.push(st.src.i); }
+function removeStep(i){ pushHistory(); markRemoved(route.steps[i]); route.steps.splice(i,1); if(cursor>=i) cursor--; refresh(); }
+function moveStep(from,to){ if(from===to) return; pushHistory(); const [s]=route.steps.splice(from,1); if(to>from) to--; route.steps.splice(to,0,s); cursor=to; refresh(); }
+function setCursor(i){ cursor=i; refresh(); scrollCursor(); const p=SIM.res[i]?.pt; if(p){ const [x,y]=toS(p); if(x<40||y<40||x>W-40||y>H-40) flyTo(p.X,p.Y); } }
+function scrollCursor(){ const el=$('#steps .cur'); el&&el.scrollIntoView({block:'nearest'}); }
+// guides imported by an older planner version are re-read from their saved original text, so new details (objectives, targets, loops) appear without re-importing
+let upgrading=false;
+/* re-read every imported guide for this route's character (race/class/faction), then add the guide steps that now apply: used for group members built from someone else's route */
+async function reapplyGuides(){ const gs=(route.guides||[]).slice(); if(!gs.length) return 0; const rid=route.id; await rawLoad(gs.map(g=>g.id)); if(route.id!==rid) return 0; let n=0;
+  for(const g of gs){ const bl=rawCache.get(g.id); if(!bl||!bl.length) continue; const txt=`RXPGuides.RegisterGuide(${JSON.stringify(g.group||'')},[[\n`+(g.cond?`<< ${g.cond}\n`:'')+`#name ${g.name}\n`+(g.xprate?`#xprate ${g.xprate}\n`:'')+bl.join('\n')+'\n]])';
+    const r=importGuides(txt,false); if(r.added?.length){ const ids=new Set(r.added.map(x=>x.id)); route.guides=route.guides.filter(x=>!ids.has(x.id)); } }
+  for(const g of route.guides||[]) if(route.steps.some(x=>x.src&&!x.src.auto&&x.src.g===g.id)) n+=fillGuide(g)||0;
+  FQ.key=null; refresh(); return n; }
+async function upgradeGuides(){ if(upgrading) return; const old=(route.guides||[]).filter(g=>(g.pv||0)<3); if(!old.length) return; upgrading=true; const rid=route.id;
+  try{ await rawLoad(old.map(g=>g.id)); if(route.id!==rid) return; let n=0;
+    for(const g of old){ const bl=rawCache.get(g.id); if(!bl||!bl.length){ g.pv=3; continue; }
+      const txt=`RXPGuides.RegisterGuide(${JSON.stringify(g.group||'')},[[\n`+(g.cond?`<< ${g.cond}\n`:'')+`#name ${g.name}\n`+(g.xprate?`#xprate ${g.xprate}\n`:'')+bl.join('\n')+'\n]])';
+      const r=importGuides(txt,false); if(r.added?.length){ const ids=new Set(r.added.map(x=>x.id)); route.guides=route.guides.filter(x=>!ids.has(x.id)); }
+      for(const x of r.refreshed||[]){ x.pv=3; n++; } g.pv=3; }
+    if(n){ refresh(); toast(`Updated ${n} imported guide${n>1?'s':''} with the latest details`); } else save();
+  }catch(e){} finally{ upgrading=false; } }
+/* ---------- search in steps ---------- */
+let findQ='', findHits=[], findPos=-1;
+function stepSearchText(s,i){ const t=stepText(s); const gs=stepGuide(s); const q=s.q&&Q(s.q); const parts=[t.t,t.sub,s.unote,s.qn,s.q,gs?.label,gs?.text,(gs?.notes||[]).join(' '),q?.n,q?.t,SIM?.res[i]?.pt?.label,SIM?.res[i]?.pt?zoneName(SIM.res[i].pt.z):'',s.text,s.item,s.npcName];
+  return parts.filter(Boolean).map(x=>rxpPlain(String(x))).join(' ').toLowerCase(); }
+function runFind(){ findQ=$('#stepFind').value.trim().toLowerCase(); findHits=[]; if(findQ){ const terms=findQ.split(/\s+/); route.steps.forEach((s,i)=>{ const t=stepSearchText(s,i); if(terms.every(w=>t.includes(w))) findHits.push(i); }); }
+  if(findPos>=findHits.length) findPos=findHits.length-1; $('#stepFindN').textContent=findQ?(findHits.length?`${findPos>=0?findPos+1:0}/${findHits.length}`:'none'):''; markFind(); }
+function markFind(){ const set=new Set(findHits); $$('#steps li[data-i]').forEach(li=>{ const i=+li.dataset.i; li.classList.toggle('fhit',set.has(i)); li.classList.toggle('fcur',findPos>=0&&findHits[findPos]===i); }); }
+function findGo(d){ if(!findHits.length) return; findPos=findPos<0?(d>0?findHits.findIndex(i=>i>cursor):-1):findPos+d; if(findPos<0) findPos=d>0?0:findHits.length-1; findPos=(findPos+findHits.length)%findHits.length; $('#stepFindN').textContent=`${findPos+1}/${findHits.length}`; markFind(); const li=$(`#steps li[data-i="${findHits[findPos]}"]`); if(li) li.scrollIntoView({block:'center'}); const p=SIM.res[findHits[findPos]]?.pt; if(p) flyTo(p.X,p.Y,Math.max(view.s,0.06)); }
+function refresh(){ { const rc=$('#routeCol'); if(rc&&document.activeElement!==rc) rc.value=route.char.rcol||'#ffcd46'; } if(route.guides?.some(g=>(g.pv||0)<3)) setTimeout(upgradeGuides,0); simulate(); if(findQ) setTimeout(runFind,0); computeGhosts(); renderSteps(); renderRight(); renderXP(); renderRouteHead(); renderHS(); requestDraw(); save(); }
+
+function renderSteps(){
+  const ul=$('#steps'); const parts=[];
+  parts.push(`<li class="start ${cursor<0?'cur':''}" data-i="-1">Start · level ${route.char.level}${+route.char.xp?' + '+fmt(route.char.xp)+' XP':''}</li>`);
+  if(cursor<0) parts.push(`<li class="insert">New steps are added here</li>`);
+  if(!route.steps.length) parts.push(`<li class="empty">Pick a yellow <b>!</b> on the map or an entry in <b>Available</b> to accept your first quest. Steps are added after the highlighted step, so you can click any step to insert before later ones.</li>`);
+  renderSteps._acr=accRuns(); pruneSections(); const runs=secRuns(); const runAt=new Map(runs.filter(x=>x.id).map(x=>[x.from,x]));
+  route.steps.forEach((s,i)=>{
+    const hr=runAt.get(i); if(hr) parts.push(secHeader(hr)); const sc=secOf(i); if(sc&&sc.col&&i!==cursor) return;
+    const r=SIM.res[i]; const tx=stepText(s);
+    const gs=s.src&&typeof G==='function'?G(s.src.g)?.steps[s.src.i]:null; const dgTags=gs&&!r.inactive?(gs.dg||[]).filter(dgOn):[]; const qTag=s.q?questDgTag(s.q):null; const allTags=stepDgTags(i);
+    const dq=s.q&&Q(s.q)&&isDungeonQuest(s.q);
+    const lvl=r.after.level+(r.after.level<MAXLVL?r.after.xp/XP_TABLE[r.after.level]:0);
+    parts.push(`<li tabindex="-1" class="step ${i===cursor?'cur':''} ${i>cursor?'future':''} ${r.inactive?'inactive':''} ${dgTags.length?'dgstep':''} ${s.opt?'optstep':''} ${selSteps.has(i)?'msel':''}" data-i="${i}" draggable="true"${sc?` style="box-shadow:inset 4px 0 0 ${sc.color}"`:''}>
+      <span class="n" title="Drag to reorder">${i+1}</span><span class="ic ${tx.cls} ${dq?'dq':''}" aria-hidden="true">${tx.ic}</span>
+      <span class="t">${''}${s.src&&s.t==='travel'&&(s.kind==='note'||s.kind==='goto')?rxpHTML(tx.t):esc(rxpPlain(tx.t))}${(()=>{const gs=s.src&&!s.src.auto?G(s.src.g)?.steps[s.src.i]:null; return gs?notesHTML(gs,s.t==='travel'&&(s.kind==='note'||s.kind==='goto')?(s.text||''):''):'';})()}${s.t==='grind'&&r.party>1?`<span class="sub">in a group of ${r.party}</span>`:''}${r.expl?`<span class="sub kx" title="${esc(r.expl.map(e=>e.n+': '+e.xp+' XP').join(', '))}">${r.expl.some(e=>e.xp)?'+'+fmt(r.expl.reduce((t,e)=>t+e.xp,0))+' XP exploring: ':'Discovers: '}${esc(r.expl.map(e=>e.n).slice(0,4).join(', '))}${r.expl.length>4?'…':''}</span>`:''}${r.walkOff?`<span class="sub kx">No kills on the way here (set on this step)</span>`:''}${r.walk?`<span class="sub kx" title="Mobs killed while walking here: 1 kill per ${s.ypk!=null&&s.ypk!==''?s.ypk+' yards (set on this step)':route.char.ypk+' yards'}, average mob level ${r.walk.lv.toFixed(1)}">+${fmt(r.walk.xp)} XP on the way (≈${r.walk.kills<10?r.walk.kills.toFixed(1):Math.round(r.walk.kills)} kills)</span>`:''}${r.kill?`<span class="sub kx">≈${fmt(r.kill.kills)} kills${r.kill.guessed?' (some counts guessed)':''}${r.party>1?` · group of ${r.party}`:''}${r.kill.dg?' · dungeon mobs':''}</span>`:''}${s.unote?`<span class="unote">${s.unote.split('\n').map(esc).join('<br>')}</span>`:''}${stickyChip(s,i)}${nowSel(s,i)}${(()=>{ const A=renderSteps._acr; if(!A) return ''; if(A.lead.has(i)) return `<span class="stk" title="Group pick-up: exported as one step with every quest giver in the target macro, so the group can split up">👥 picks up ${A.lead.get(i).length+1} quests together</span>`; if(A.mem.has(i)) return `<span class="stk" title="Picked up together with step ${A.mem.get(i)+1} (group pick-up)">👥 with step ${A.mem.get(i)+1}</span>`; return ''; })()}${r&&r.grpOf!=null?`<span class="stk" title="Close to step ${r.grpOf+1}: done together on one loop and exported as one RestedXP step. Click to keep it separate." data-nogrp="${i}">🔗 with step ${r.grpOf+1}</span>`:r&&r.grpN?`<span class="stk" title="The next ${r.grpN-1} objective step(s) are in the same area: done together on this loop">🔗 ${r.grpN} objectives together</span>`:''}${s.nogrp?`<span class="stk" data-nogrp="${i}" title="Kept separate from nearby objectives: click to allow grouping again">⛓ separate</span>`:''}${s.t==='train'&&s.npc&&r&&!r.inactive?`<details class="tspd"><summary>Spells</summary>${trainList(s.npc,r.before?.level??SIM.st.level,prevTrainLevel(i))}</details>`:''}${r.path?`<span class="stk" data-pathed="${i}" style="cursor:pointer" title="The RestedXP arrow loops through these points (#loop). Click to see or edit it on the map.">🔁 path · ${r.path.length} pts</span>`:''}${s.t==='accept'&&ESCORT.has(s.q)?`<span class="sub" style="color:var(--warn)">⚠ ${esc(ESC_NOTE)}</span>`:''}${allTags.map(t=>`<span class="dgtag" data-dgsel="${esc(t)}" title="${dgTags.includes(t)?`Only because you're running ${esc(dgName(t))}`:`${esc(dgName(t))} quest`}. Click to select every ${esc(t)} step">${esc(t)}</span>`).join('')}${tx.sub?`<span class="sub">${esc(tx.sub)}</span>`:''}${r.inactive?`<span class="wrn">${esc(r.inactive)}</span>`:''}${r.err.map(e=>{ const m=e.match(/^Requires level (\d+)/); return `<span class="err">${esc(e)}${m?` <button class="linkish" data-fixgrind="${i}:${m[1]}">Add a grind to level ${m[1]} before this</button>`:''}</span>`; }).join('')}${r.warn.map(e=>`<span class="wrn">${esc(e)}</span>`).join('')}${r.custom&&s.t==='turnin'?`<button class="linkish" data-uxp="${i}">${route.qxp?.[s.q]?'Change XP reward':'Set XP reward'}</button>`:''}</span>
+      <span class="x">${r.gained||s.xpo!=null?`<b${s.xpo!=null?' title="XP set by you"':''}>+${fmt(r.gained)}${s.xpo!=null?'*':''}</b><br>`:''}${lvl.toFixed(1)}${Math.abs(r.money||0)>=100?`<br><span class="note" style="font-size:10px" title="Estimated money from this step">${r.money>0?'+':''}${fmtG(r.money)}</span>`:''}</span>
+      <span class="sbtns">${s.q?`<a class="wh" href="${whURL(s.q,s.qn)}" target="_blank" rel="noopener" title="Open this quest on Wowhead">wh↗</a>`:''}<button class="opt ${s.opt?'on':''}" data-opt="${i}" title="${s.opt?'Optional (click to make required)':'Mark as optional'}" aria-pressed="${!!s.opt}">opt</button>${!stepGuide(s)&&s.t==='accept'&&Q(s.q)?.sh?`<button class="ed ${s.shared?'on':''}" data-shr="${i}" title="${s.shared?'Shared by a party member (click to pick it up from the NPC instead)':'Shareable quest: click if a party member will share it with you'}" aria-label="Shared quest for step ${i+1}">🤝</button>`:''}${!stepGuide(s)&&['accept','complete','turnin','custom','grind','travel'].includes(s.t)?`<button class="ed ${s.stk?'on':''}" data-stk="${i}" title="Sticky: ${s.stk==='next'?'with next step':s.stk==='sticky'?'until done':'off'} (click to change)" aria-label="Sticky for step ${i+1}">📌</button>`:''}<button class="ed ${s.unote||s.xpo!=null||s.ypk!=null?'on':''}" data-edit="${i}" title="Edit step: note, XP${s.src?'':', text'}" aria-label="Edit step ${i+1}">✎</button><button class="del" data-del="${i}" aria-label="Delete step ${i+1}">×</button></span></li>`);
+    if(i===cursor && i<route.steps.length-1) parts.push(`<li class="insert">New steps are added here</li>`);
+    { const fm=forkMark(i); if(fm) parts.push(fm); }
+  });
+  if(selSteps.size>1) parts.unshift(`<li class="selbar"><b>${selSteps.size} steps selected</b> <button class="btn sm" data-blk="up" title="Move the block up one step">▲ Up</button><button class="btn sm" data-blk="down" title="Move the block down one step">▼ Down</button><button class="btn sm" data-blk="cursor" title="Move the block to just after the highlighted step">Move after step…</button><button class="btn sm" data-blk="ypk" title="Kills on the way for these steps: yards per kill, 0 = none, empty = route setting">Travel kills…</button>${route.group?`<button class="btn sm" data-blk="topaths" title="Copy these steps into the other paths, after the same step they follow here">Copy to other paths</button>`:''}<button class="btn sm" data-blk="sec" title="Group steps ${'${'}Math.min(...selSteps)+1}–${'${'}Math.max(...selSteps)+1} into a named, coloured section">Make section</button><button class="btn sm" data-blk="del">Delete</button><button class="btn sm" data-blk="clear">Clear</button><span class="note">Drag any selected step to move them all</span></li>`);
+  ul.innerHTML=parts.join(''); if(findQ) markFind();
+}
+let selSteps=new Set(), selAnchor=null;
+// RestedXP keeps #completewith/#sticky steps on screen alongside later steps; show that in the list
+function nowSel(s,i){ if(!['accept','complete','turnin'].includes(s.t)||!s.q||!isSticky(s)||SIM.res[i]?.passive!=null) return ''; const w=s.t==='accept'?'Accept':s.t==='turnin'?'Turn in':'Complete';
+  return `<select class="stknow" data-now="${i}" title="Add a normal ${w.toLowerCase()} step later in the route: this sticky step then becomes 'if you can on the way' and the new one is where it has to be done"><option value="">${w} now…</option><option value="here">…right after this step</option>${cursor>i?`<option value="cur">…after step ${cursor+1} (highlighted)</option>`:''}</select>`; }
+function stepNow(i,at){ const s=route.steps[i]; const n={t:s.t,q:s.q,stk:false}; for(const k of ['obj','qn','objText','cl','tgt','loc','counts','pin']) if(s[k]!=null) n[k]=Array.isArray(s[k])?[...s[k]]:typeof s[k]==='object'?{...s[k]}:s[k];
+  const P=pathOf(s); if(P&&P.length>1&&s.t==='complete'){ n.path=P.map(l=>({...l})); n.pathSrc=s.pathSrc||'guide'; }
+  cursor=at-1; addStep(n); toast(`Added "${s.t==='accept'?'Accept':s.t==='turnin'?'Turn in':'Complete'} now" as step ${cursor+1}: step ${i+1} is now done on the way if you can.`,4500); }
+/* ---------- class trainer spells (CMaNGOS classic-db, Classic 1.12 baseline) ---------- */
+const gsc=c=>{ c=+c||0; const g=Math.floor(c/1e4), sv=Math.floor(c%1e4/100), cp=c%100; return (g?g+'g ':'')+(sv?sv+'s ':'')+(cp||(!g&&!sv)?cp+'c':'').trim(); };
+function trainerSpells(npc){ const T=META.tsp; const k=T?.n?.[npc]; if(k!=null) return T.t[k]; const cls=META.trn?.[npc]?.[1]; if(!cls||!T) return null; /* Forever-only trainer: use the fullest list of another trainer of that class */ let best=null; for(const id in T.n){ if(META.trn?.[id]?.[1]!==cls) continue; const L=T.t[T.n[id]]; if(!best||L.length>best.length) best=L; } return best; }
+function prevTrainLevel(i){ for(let j=i-1;j>=0;j--){ const x=route.steps[j]; if(x.t==='train'&&!SIM.res[j]?.inactive) return SIM.res[j]?.before?.level??null; } return null; }
+function trainList(npc,lv,since){ const L=trainerSpells(npc); if(!L) return '<div class="note">No spell list for this trainer.</div>'; const nxt=lv%2?lv+1:lv+2;
+  const now=L.filter(x=>x[0]<=lv&&(since==null||x[0]>since)), soon=L.filter(x=>x[0]>lv&&x[0]<=nxt), cost=now.reduce((a,x)=>a+x[3],0), maxL=L.reduce((a,x)=>Math.max(a,x[0]),0);
+  const row=(x,red)=>`<div class="tsp${red?' later':''}"><span class="tl">${x[0]}</span> ${esc(x[1])}${x[2]?` <span class="note">${esc(x[2])}</span>`:''} <span class="note">${gsc(x[3])}</span></div>`;
+  return `<div class="note">${now.length?`${now.length} to train at level ${lv}${since!=null?` (new since you trained at ${since})`:''} · ${gsc(cost)}`:`Nothing new at level ${lv}${since!=null?' since level '+since:''}`}</div>${now.map(x=>row(x,0)).join('')}${soon.length?`<div class="note" style="margin-top:3px">Level ${nxt}:</div>${soon.map(x=>row(x,1)).join('')}`:''}${maxL&&maxL<lv+2?`<div class="note">This trainer only teaches up to level ${maxL}.</div>`:''}<div class="note" style="opacity:.7">Classic 1.12 trainer data (CMaNGOS); Forever changes may differ.</div>`; }
+function healthReport(){ simulate(); const rows={err:[],pen:[],hard:[],warn:[],open:[]}; const N=i=>{ const sc=secOf(i); return (sc?'['+sc.name+'] ':'')+rxpPlain(stepText(route.steps[i]).t); };
+  SIM.res.forEach((r,i)=>{ const s=route.steps[i]; if(r.inactive||r.skip) return;
+    for(const e of r.err) rows.err.push({i,t:N(i),why:e});
+    if(r.pen) rows.pen.push({i,t:N(i),why:`level ${r.pen.lvl}, quest level ${r.pen.ql}: ${fmt(r.pen.xp)} of ${fmt(r.pen.full)} XP (−${fmt(r.pen.full-r.pen.xp)})`,lost:r.pen.full-r.pen.xp});
+    if(s.t==='accept'&&Q(s.q)&&r.lvAt!=null&&!r.err.length){ const d=diffClass(Q(s.q).l,r.lvAt); if(d==='red'||d==='orange') rows.hard.push({i,t:N(i),why:`quest level ${Q(s.q).l} at your level ${r.lvAt} (${d==='red'?'red: very hard':'orange: hard'})`}); }
+    for(const w of r.warn) if(!r.pen&&!/^(Forever quest|Done along the way|XP penalty)/.test(w)) rows.warn.push({i,t:N(i),why:w}); });
+  for(const [q,v] of SIM.st.log) rows.open.push({i:null,t:Q(q)?.n||('Quest '+q),why:v.done?'ready to turn in but never handed in':'still in your log at the end of the route'});
+  const lost=rows.pen.reduce((a,x)=>a+x.lost,0);
+  const sec=(k,title,note)=>rows[k].length?`<details ${k==='err'||k==='pen'?'open':''} class="hsec"><summary><b>${title}</b> (${rows[k].length})${note?' · '+note:''}</summary>${rows[k].map(x=>`<div class="hrow"${x.i!=null?` data-hgo="${x.i}"`:''}>${x.i!=null?`<span class="hn">${x.i+1}</span>`:''}<span><b>${esc(x.t)}</b><br><span class="note">${esc(x.why)}</span></span></div>`).join('')}</details>`:'';
+  const tot=rows.err.length+rows.pen.length+rows.hard.length;
+  $('#hlBody').innerHTML=(tot?'':'<p>✅ No problems, XP penalties or hard pick-ups found.</p>')+sec('err','Problems','steps that can\'t be done as planned (level too low, not in log, log full…)')+sec('pen','XP penalty hand-ins',`${fmt(lost)} XP lost in total`)+sec('hard','Hard pick-ups','quests 3+ levels above you when accepted')+sec('warn','Other warnings','')+sec('open','Quests left in your log','');
+  $('#hlSum').textContent=`${rows.err.length} problem${rows.err.length===1?'':'s'} · ${rows.pen.length} penalised hand-in${rows.pen.length===1?'':'s'} (−${fmt(lost)} XP) · ${rows.hard.length} hard pick-up${rows.hard.length===1?'':'s'}`;
+  $('#dlgHealth').showModal(); }
+document.addEventListener('click',e=>{ const h=e.target.closest('[data-hgo]'); if(h){ $('#dlgHealth').close(); setCursor(+h.dataset.hgo); } });
+function stickyAccIdx(q){ for(let k=Math.min(cursor,route.steps.length-1);k>=0;k--){ const x=route.steps[k]; if(x.t==='accept'&&x.q===q&&!SIM.res[k]?.inactive) return isSticky(x)&&SIM.res[k]?.passive==null?k:-1; } return -1; }
+const accNowBtn=(q,sm)=>stickyAccIdx(q)>=0?`<button class="btn${sm?' sm':''}" data-accnow="${q}" title="You have it from a sticky accept (step ${stickyAccIdx(q)+1}); add the step where you must have it">Accept now</button>`:'';
+document.addEventListener('change',e=>{ const sc=e.target.closest('input[data-seccol]'); if(sc){ const S=route.sections?.[sc.dataset.seccol]; if(S){ pushHistory(); S.color=sc.value; refresh(); } return; } const rc=e.target.closest('#routeCol'); if(rc){ pushHistory(); route.char.rcol=rc.value; save(); requestDraw(); return; } const t=e.target.closest('select.stknow'); if(!t||!t.value) return; const i=+t.dataset.now; stepNow(i,t.value==='here'?i+1:cursor+1); });
+function stickyChip(s,i){ const gs=stepGuide(s); if(!gs&&s.stk) return `<span class="stk" title="${esc(s.stk==='next'?'Exported with #completewith next: RestedXP shows it together with the next step and the arrow skips it. Do it on the way.':'Exported with #sticky: RestedXP keeps it on screen until done while you carry on; the arrow skips it.')}">📌 ${s.stk==='next'?'with next step':'sticky'}</span>`; const cw=gs?.cw||s.cw; if(!(gs?.sticky||cw)) return '';
+  let tip, lbl;
+  if(cw==='next'){ tip='RestedXP shows this step together with the next one and ticks it off when you move past it. Do it passively on the way.'; lbl='with next step'; }
+  else if(cw){ const j=route.steps.findIndex((x,k)=>k>i&&x.src&&x.src.g===s.src.g&&(G(x.src.g)?.steps[x.src.i]?.label===cw)); tip=`RestedXP keeps this on screen while you do the following steps, until you reach ${j>=0?'step '+(j+1)+' ('+rxpPlain(stepText(route.steps[j]).t)+')':'the guide step labelled '+cw+' (not in your route)'}.`; lbl=j>=0?'until step '+(j+1):'until '+cw; }
+  else { tip='RestedXP keeps this step on screen until it is done, while you carry on with the following steps.'; lbl='sticky'; }
+  return `<span class="stk" title="${esc(tip)}">📌 ${esc(lbl)}</span>`; }
+const qdgCache=new Map();
+let qNameIdx=null;
+function questDgTag(qid){ if(qdgCache.has(qid)) return qdgCache.get(qid); let tag=baseDgTag(qid);
+  if(!tag&&Q(qid)){ if(!qNameIdx){ qNameIdx=new Map(); for(const id in DB.q){ const n=DB.q[id].n.replace(/\s*\(\d+\/\d+\)$/,''); if(!qNameIdx.has(n)) qNameIdx.set(n,[]); qNameIdx.get(n).push(+id); } }
+    for(const o of qNameIdx.get(Q(qid).n.replace(/\s*\(\d+\/\d+\)$/,''))||[]) if(o!==qid){ const t=baseDgTag(o); if(t){ tag=t; break; } } } // same-name chain parts (e.g. Hidden Enemies 1-5)
+  qdgCache.set(qid,tag); return tag; }
+const bdgCache=new Map();
+function baseDgTag(qid){ if(bdgCache.has(qid)) return bdgCache.get(qid); let tag=null; const q=Q(qid);
+  if(q&&isDungeonQuest(qid)){ let name=META.dungeons[q.z]?.n; if(!name){ const p=objectives(qid).flatMap(o=>o.pts).find(p=>p.dg); if(p) name=dungeonAt(p); }
+    if(name){ const d=DUNGEONS.find(d=>d[1]===name)||DUNGEONS.find(d=>name.startsWith(d[1])||d[1].startsWith(name)); tag=d?d[0]:name; } }
+  bdgCache.set(qid,tag); return tag; }
+function stepDgTags(i){ const s=route.steps[i]; const out=[]; const gs=s.src?G(s.src.g)?.steps[s.src.i]:null;
+  if(gs) for(const t of gs.dg||[]) if(dgOn(t)&&!out.includes(t)) out.push(t);
+  const t=s.q?questDgTag(s.q):null; if(t&&!out.includes(t)) out.push(t); return out; }
+function selectDungeon(tag,add){ if(!add) selSteps.clear(); route.steps.forEach((_,i)=>{ if(stepDgTags(i).includes(tag)) selSteps.add(i); }); renderSteps(); toast(selSteps.size?`Selected ${selSteps.size} ${tag} steps`:`No ${tag} steps`); }
+function moveBlock(idxs,to){ // move steps idxs (any order) so they sit before index `to` (to may equal steps.length)
+  idxs=[...new Set(idxs)].sort((a,b)=>a-b); if(!idxs.length) return; const items=idxs.map(i=>route.steps[i]);
+  const ins=to-idxs.filter(i=>i<to).length; pushHistory();
+  for(let k=idxs.length-1;k>=0;k--) route.steps.splice(idxs[k],1);
+  route.steps.splice(ins,0,...items); selSteps=new Set(items.map((_,k)=>ins+k)); selAnchor=ins; cursor=ins+items.length-1; refresh(); scrollCursor(); }
+/* ---------- sections (named, coloured runs of steps; a 'cut' section exports as its own guide) ---------- */
+const SEC_COLS=['#4fc3f7','#ff8a65','#ba68c8','#81c784','#f06292','#e6ee9c','#4db6ac','#9575cd','#ffb74d','#90a4ae'];
+let SEC_ONLY=null;
+const secOf=i=>{ const id=route.steps[i]?.sec; return id&&route.sections?.[id]?{id,...route.sections[id]}:null; };
+function secRuns(){ const out=[]; route.steps.forEach((s,i)=>{ const id=s.sec&&route.sections?.[s.sec]?s.sec:null; const last=out[out.length-1]; if(last&&last.id===id) last.to=i; else out.push({id,from:i,to:i}); }); return out; }
+function pruneSections(){ const used=new Set(route.steps.map(s=>s.sec).filter(Boolean)); for(const k of Object.keys(route.sections||{})) if(!used.has(k)) delete route.sections[k]; for(const s of route.steps) if(s.sec&&!route.sections[s.sec]) delete s.sec; }
+async function makeSection(idx){ const a=idx[0], b=idx[idx.length-1]; const name=await askText(`Name for the section (steps ${a+1}–${b+1}):`,'Section '+(Object.keys(route.sections||{}).length+1),'Create','text'); if(name==null) return; pushHistory();
+  route.sections=route.sections||{}; const used=new Set(Object.values(route.sections).map(x=>x.color)); const id=uid(); route.sections[id]={name:name.trim()||'Section',color:SEC_COLS.find(c=>!used.has(c))||SEC_COLS[Object.keys(route.sections).length%SEC_COLS.length],cut:false,col:false};
+  for(let i=a;i<=b;i++) route.steps[i].sec=id; pruneSections(); selSteps.clear(); refresh(); toast(`Section “${route.sections[id].name}” created: use ✂ on its header to export it as its own guide.`,4500); }
+function secStats(r){ const R0=SIM.res[r.from], R1=SIM.res[r.to]; const lv=a=>a?a.level+(a.level<MAXLVL?a.xp/XP_TABLE[a.level]:0):0; let xp=0,t=0,ti=0; for(let i=r.from;i<=r.to;i++){ const x=SIM.res[i]; if(!x||x.inactive) continue; xp+=x.gained||0; t+=x.dt||0; if(route.steps[i].t==='turnin') ti++; }
+  return {l0:lv(R0?.before),l1:lv(R1?.after),xp,t,ti,n:r.to-r.from+1}; }
+function secHeader(r){ const S=route.sections[r.id]; const st=secStats(r);
+  return `<li class="sechdr" style="--sc:${S.color}" data-secid="${r.id}"><button class="secbtn" data-sec="col:${r.id}" title="${S.col?'Expand':'Collapse'}">${S.col?'▸':'▾'}</button><input type="color" class="seccol" data-seccol="${r.id}" value="${S.color}" title="Section colour"><b class="secname">${esc(S.name)}</b>${S.cut?'<span class="seccut" title="Exported as its own RestedXP guide">✂ own guide</span>':''}<span class="secst">${st.l0.toFixed(1)} → ${st.l1.toFixed(1)} · +${fmt(st.xp)} XP · ${st.ti} turn-ins · ${fmtT(st.t)} · steps ${r.from+1}–${r.to+1}</span><span class="secact"><button class="secbtn" data-sec="hide:${r.id}" title="${S.hide?'Show this section on the map':'Hide this section on the map'}"${S.hide?' style="opacity:.35"':''}>👁</button><button class="secbtn" data-sec="zoom:${r.id}" title="Zoom the map to this section">⌖</button><button class="secbtn" data-sec="cut:${r.id}" title="${S.cut?'Stop exporting as its own guide':'Cut: export this section as its own RestedXP guide'}"${S.cut?' style="color:var(--gold)"':''}>✂</button><button class="secbtn" data-sec="cat:${r.id}" title="Save this section to the catalog, to reuse in other routes">📚</button><button class="secbtn" data-sec="ren:${r.id}" title="Rename">✎</button><button class="secbtn" data-sec="del:${r.id}" title="Remove the section (keeps the steps)">✕</button></span></li>`; }
+async function secAction(a,id){ const S=route.sections?.[id]; if(!S) return;
+  if(a==='col'){ S.col=!S.col; save(); renderSteps(); return; }
+  if(a==='cat'){ secToCatalog(id); return; }
+  if(a==='hide'){ S.hide=!S.hide; save(); renderSteps(); requestDraw(); return; }
+  if(a==='zoom'){ { const r=secRuns().find(x=>x.id===id); const pts=[]; for(let i=r.from;i<=r.to;i++) if(SIM.res[i]?.pt) pts.push(SIM.res[i].pt); if(pts.length){ const xs=pts.map(p=>p.X), ys=pts.map(p=>p.Y); const bw=Math.max(80,Math.max(...xs)-Math.min(...xs)), bh=Math.max(80,Math.max(...ys)-Math.min(...ys)); flyTo((Math.min(...xs)+Math.max(...xs))/2,(Math.min(...ys)+Math.max(...ys))/2,Math.min(4,Math.min(W/(bw*1.3),H/(bh*1.3)))); } } return; }
+  if(a==='cut'){ pushHistory(); S.cut=!S.cut; refresh(); toast(S.cut?`“${S.name}” will export as its own guide, linked to the next one with #next.`:`“${S.name}” exports inside the main guide again.`); return; }
+  if(a==='ren'){ const v=await askText('Section name:',S.name,'Rename','text'); if(v==null) return; pushHistory(); S.name=v.trim()||S.name; const k=SEC_COLS.indexOf(S.color); refresh(); return; }
+  if(a==='color'){ pushHistory(); S.color=SEC_COLS[(SEC_COLS.indexOf(S.color)+1)%SEC_COLS.length]; refresh(); return; }
+  if(a==='del'){ pushHistory(); for(const st of route.steps) if(st.sec===id) delete st.sec; delete route.sections[id]; refresh(); return; } }
+/* ---------- parallel paths: routes in the same set, simulated side by side; a shared start = the fork point ---------- */
+const PATH_COLS=['#ffcd46','#4fc3f7','#ff8a65','#ba68c8','#81c784','#f06292'];
+const pathSet=()=>route.group?store.routes.filter(r=>r.group===route.group):[route];
+const stepSig=s=>[s.t,s.q||'',s.obj||'',s.kind||'',s.text||'',s.mode||'',s.level||'',s.amount||'',s.npc||'',s.item||'',s.node||'',s.gy??''].join('|');
+function sharedPrefix(a,b){ const n=Math.min(a.steps.length,b.steps.length); let k=0; while(k<n&&stepSig(a.steps[k])===stepSig(b.steps[k])) k++; return k; }
+const PSIM=new Map();
+function simRoute(r){ const key=(r.savedAt||0)+':'+r.steps.length+':'+(r.char.level||1); const c=PSIM.get(r.id); if(r!==route&&c&&c.key===key) return c.d;
+  let d; if(r===route){ d=pathData(SIM,r); } else { const R0=route, C0=cursor, S0=SIM; try{ route=r; cursor=r.steps.length-1; simulate(); d=pathData(SIM,r); } finally { route=R0; cursor=C0; SIM=S0; } }
+  PSIM.set(r.id,{key,d}); return d; }
+function pathData(S,r){ const lvT={}; let ti=0, errs=0; const pts=[]; S.res.forEach((x,i)=>{ if(x.inactive) return; if(x.err?.length) errs++; if(r.steps[i].t==='turnin') ti++; if(x.pt&&!x.stk) pts.push({X:x.pt.X,Y:x.pt.Y,z:x.pt.z,i}); const a=x.after; if(a) for(let L=(x.before?.level||1)+1;L<=a.level;L++) if(lvT[L]==null) lvT[L]=x.tAt; });
+  const e=S.end; return {pts,lvT,errs,endL:e.level+(e.level<MAXLVL?e.xp/XP_TABLE[e.level]:0),endT:e.t||0,ti,n:r.steps.length,start:+r.char.level||1}; }
+function drawPaths(){ if(!route.group) return; for(const r of pathSet()){ if(r===route||r.cmpHide) continue; const d=simRoute(r); const k=sharedPrefix(route,r); const P=d.pts.filter(p=>p.i>=Math.max(0,k-1)); if(P.length<2) continue;
+    const col=r.char.rcol||'#cccccc'; ctx.strokeStyle=col; ctx.globalAlpha=.75; ctx.lineWidth=2.5; ctx.setLineDash([8,6]); ctx.beginPath(); let last=null;
+    for(const p of P){ const [x,y]=toS(p); const far=last&&Math.hypot(p.X-last.X,p.Y-last.Y)>5000; if(!last||far) ctx.moveTo(x,y); else ctx.lineTo(x,y); last=p; } ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1;
+    const e=P[P.length-1]; const [x,y]=toS(e); haloText(r.name,x,y-14,'600 12px "Alegreya Sans", sans-serif',col,'rgba(20,12,4,.85)',3); } }
+function openPaths(){ const set=pathSet(); const rows=set.map(r=>{ const d=simRoute(r); const k=r===route?null:sharedPrefix(route,r);
+    return `<tr><td><input type="color" data-pcol="${r.id}" value="${r.char.rcol||'#ffcd46'}" style="width:24px;height:20px;padding:0;border:0;background:none"></td><td><b>${esc(r.name)}</b>${r===route?' <span class="note">(editing)</span>':''} <span class="note">${esc(r.char.race+' '+r.char.cls)}${r.member?' · group of '+(r.char.party||1):''}</span>${d.errs?` <span style="color:#e0533d" title="Steps that can't be done as planned for this character: open it and use Health">⚠ ${d.errs}</span>`:''}<br><span class="note">${k==null?'':k?`shares steps 1–${k} with this path · forks after step ${k}`:'no shared start yet'}</span></td><td>${d.endL.toFixed(2)}</td><td>${fmtT(d.endT)}</td><td>${d.ti}</td><td>${d.n}</td><td style="white-space:nowrap">${r===route?'':`<button class="btn sm" data-pact="go:${r.id}">Edit</button><label class="note"><input type="checkbox" data-pshow="${r.id}" ${r.cmpHide?'':'checked'}> map</label>`}${set.length>1?`<button class="btn sm" data-pact="keep:${r.id}" title="Keep only this path: the others leave the set (not deleted)">Keep</button><button class="btn sm" data-pact="drop:${r.id}" title="Remove from the set (the route itself is kept)">Remove</button><button class="btn sm" data-pact="del:${r.id}" title="Delete this route">🗑</button>`:''}</td></tr>`; }).join('');
+  const D=set.map(r=>simRoute(r)); const lo=Math.min(...D.map(d=>d.start))+1, hi=Math.max(...D.map(d=>Math.floor(d.endL))); let race='';
+  if(set.length>1&&hi>=lo){ race=`<h4 style="margin:10px 0 4px">Time to reach each level</h4><table class="ptab"><tr><th>Level</th>${set.map(r=>`<th style="color:${r.char.rcol||'inherit'}">${esc(r.name)}</th>`).join('')}</tr>${Array.from({length:hi-lo+1},(_,j)=>lo+j).map(L=>{ const ts=D.map(d=>d.lvT[L]); const best=Math.min(...ts.filter(t=>t!=null)); return `<tr><td>${L}</td>${ts.map(t=>`<td${t!=null&&t===best?' style="color:var(--gold);font-weight:700"':''}>${t==null?'–':fmtT(t)}</td>`).join('')}</tr>`; }).join('')}</table>`; }
+  const others=store.routes.filter(r=>!set.includes(r));
+  $('#pathBody').innerHTML=`<table class="ptab"><tr><th></th><th>Path</th><th>End level</th><th>/played</th><th>Turn-ins</th><th>Steps</th><th></th></tr>${rows}</table>${race}
+    <div class="row" style="margin-top:10px;gap:6px;flex-wrap:wrap;align-items:center"><b>Group:</b><button class="btn sm gold" data-pact="member:empty" title="A new character with its own race, class and starter zone">Add group member</button><button class="btn sm" data-pact="member:copy" title="A new character that starts with a copy of this path">Add member (copy this path)</button><label class="note"><input type="checkbox" id="pathSync" ${store.pathSync?.[route.group]?'checked':''}> New steps go to every path</label><button class="btn sm gold" data-pact="expgrp:" title="One RestedXP guide for the whole group: steps only some members do are tagged with their race/class, so each player sees only their own">Export group guide</button><button class="btn sm" data-pact="expall:" title="One RestedXP file with a separate guide for each path">Export separate guides</button></div>
+    <div class="row" style="margin-top:6px;gap:6px;flex-wrap:wrap"><button class="btn sm" data-pact="fork:after">Fork at highlighted step (${cursor+1})</button><button class="btn sm" data-pact="fork:copy">Fork: copy the whole route</button><button class="btn sm" data-pact="new:">New empty path</button>${others.length?`<select id="pathAdd"><option value="">Add an existing route…</option>${others.map(r=>`<option value="${r.id}">${esc(r.name)}</option>`).join('')}</select>`:''}</div>
+    <p class="note" style="margin:8px 0 0">Paths are separate routes in one set: edit each freely. Where they begin with the same steps, that shared start is their fork point. Other paths show on the map as dashed lines from where they split off.</p>`;
+  if(!$('#dlgPaths').open) $('#dlgPaths').showModal(); }
+async function pathAct(a,id){ const set=pathSet(); const r=store.routes.find(x=>x.id===id);
+  const ensureGroup=()=>{ if(!route.group){ route.group=uid(); } if(!route.char.rcol) route.char.rcol=CLS_COL[route.char.cls]||PATH_COLS[0]; };
+  const nextCol=()=>{ const used=new Set(pathSet().map(x=>x.char.rcol)); return PATH_COLS.find(c=>!used.has(c))||PATH_COLS[pathSet().length%PATH_COLS.length]; };
+  if(a==='member'){ ensureGroup(); const name=await askText('Name for the group member:','Member '+(pathSet().length+1),'Create','text'); if(name==null) return openPaths();
+    const nr=id==='copy'?await cloneRoute(route,name.trim()||'Member'):(()=>{ const x=newRoute({char:{...route.char,level:1,xp:0}}); store.routes.push(x); return x; })(); nr.name=name.trim()||nr.name; nr.group=route.group; nr.member=true; route.member=true; nr.char.rcol=CLS_COL[nr.char.cls]||nextCol(); delete nr.cmpHide;
+    const n=pathSet().filter(x=>x.member).length; for(const x of pathSet()) if(x.member) x.char.party=Math.max(+x.char.party||1,n);
+    route=nr; cursor=nr.steps.length-1; history=[]; FQ.key=null; refresh(); saveNow&&saveNow(); $('#dlgPaths').close(); toast(`Set ${nr.name}'s race and class (group size is now ${n}).`,4000); openChar(); return; }
+  if(a==='expall'){ exportAllPaths(); return; }
+  if(a==='expgrp'){ exportGroupGuide(); return; }
+  if(a==='fork'||a==='new'){ ensureGroup(); const name=await askText('Name for the new path:',route.name+(a==='fork'&&id==='after'?' – fork '+(cursor+1):' – path '+(pathSet().length+1)),'Create','text'); if(name==null) return openPaths();
+    const nr=a==='new'?(()=>{ const x=newRoute({char:{...route.char}}); store.routes.push(x); return x; })():await cloneRoute(route,name.trim()||'Path',id==='after'?cursor:null); nr.name=name.trim()||nr.name; nr.group=route.group; nr.char.rcol=CLS_COL[nr.char.cls]||nextCol(); delete nr.cmpHide;
+    route=nr; cursor=nr.steps.length-1; history=[]; FQ.key=null; refresh(); saveNow&&saveNow(); toast(`Now editing “${nr.name}”. Switch paths with Paths or the route list.`,4000); return openPaths(); }
+  if(a==='go'&&r){ route=r; cursor=r.steps.length-1; history=[]; FQ.key=null; selQuest=null; refresh(); return openPaths(); }
+  if(a==='add'&&r){ ensureGroup(); r.group=route.group; if(!r.char.rcol) r.char.rcol=CLS_COL[r.char.cls]||nextCol(); save(); requestDraw(); return openPaths(); }
+  if(a==='drop'&&r){ delete r.group; if(pathSet().length<=1) delete route.group; save(); requestDraw(); return openPaths(); }
+  if(a==='keep'&&r){ for(const x of set) if(x!==r) delete x.group; delete r.group; route=r; cursor=r.steps.length-1; history=[]; FQ.key=null; refresh(); toast(`Kept “${r.name}”. The other paths are still in your route list.`,4000); return openPaths(); }
+  if(a==='del'&&r){ if(!confirm(`Delete the route “${r.name}”?`)) return; store.routes=store.routes.filter(x=>x!==r); if(r===route){ route=set.find(x=>x!==r)||store.routes[0]; cursor=route.steps.length-1; history=[]; FQ.key=null; } if(pathSet().length<=1) delete route.group; refresh(); saveNow&&saveNow(); return openPaths(); } }
+document.addEventListener('click',e=>{ const b=e.target.closest('[data-pact]'); if(!b) return; const [a,id]=b.dataset.pact.split(':'); pathAct(a,id); });
+document.addEventListener('change',e=>{ const t=e.target; if(t.id==='pathSync'){ store.pathSync=store.pathSync||{}; store.pathSync[route.group]=t.checked; save(); return; } if(t.id==='pathAdd'&&t.value) return pathAct('add',t.value); if(t.dataset?.pshow){ const r=store.routes.find(x=>x.id===t.dataset.pshow); if(r){ r.cmpHide=!t.checked; save(); requestDraw(); } } if(t.dataset?.pcol){ const r=store.routes.find(x=>x.id===t.dataset.pcol); if(r){ r.char.rcol=t.value; save(); refresh(); openPaths(); } } });
+function stepFor(r,st){ const x=JSON.parse(JSON.stringify(st)); x.id=uid(); delete x.sec; if(x.src&&!x.src.auto){ const g=G(x.src.g); const tg=g&&(r.guides||[]).find(y=>y.name===g.name); if(tg) x.src={...x.src,g:tg.id}; else delete x.src; } return x; }
+function copyToPaths(steps,prevStep,targets){ let n=0; const sig=prevStep?stepSig(prevStep):null;
+  for(const r of targets){ let at=r.steps.length; if(sig){ for(let k=r.steps.length-1;k>=0;k--) if(stepSig(r.steps[k])===sig){ at=k+1; break; } } else at=0;
+    r.steps.splice(at,0,...steps.map(st=>stepFor(r,st))); n++; } if(n){ PSIM.clear(); saveNow&&saveNow(); requestDraw(); } return n; }
+async function exportAllPaths(){ const set=pathSet(); const R0=route,C0=cursor,S0=SIM; const parts=[]; const nm0=$('#expName').value;
+  try{ for(const r of set){ await rawLoad((r.guides||[]).map(g=>g.id)); route=r; cursor=r.steps.length-1; simulate(); $('#expName').value=r.name; const t=buildRXP(); parts.push(parts.length?t.replace(/^--[^\n]*\n/gm,''):t); } }
+  finally{ route=R0; cursor=C0; SIM=S0; $('#expName').value=nm0; }
+  $('#dlgPaths').close(); $('#expGroup').value=route.guide?.group||'Forever Routes'; setSeg('#expMode','rxp'); $('#expText').value=parts.join('\n\n'); $('#expMsg').innerHTML=`<div>One file with a guide for each of the ${set.length} paths: ${set.map(r=>esc(r.name)).join(', ')}. Each player loads the file and picks their own guide.</div>`; $('#dlgExport').showModal(); }
+/* one guide for the whole group: each member's export merged; steps not shared by everyone get RestedXP << race/class tags */
+const grpRace=r=>r.replace(/\s+/g,'');
+function lcsPairs(a,b){ const n=a.length,m=b.length; const W=m+1; const dp=new Uint16Array((n+1)*W); for(let i=n-1;i>=0;i--) for(let j=m-1;j>=0;j--) dp[i*W+j]=a[i]===b[j]?dp[(i+1)*W+j+1]+1:Math.max(dp[(i+1)*W+j],dp[i*W+j+1]);
+  const P=[]; let i=0,j=0; while(i<n&&j<m){ if(a[i]===b[j]){ P.push([i,j]); i++; j++; } else if(dp[(i+1)*W+j]>=dp[i*W+j+1]) i++; else j++; } return P; }
+function mergeSeqs(seqs,keyOf){ /* seqs: [[item,...] per member] → [{v:item(first seen), m:Set(member idx), per:Map}] */
+  let out=[]; seqs.forEach((sq,mi)=>{ if(!out.length){ out=sq.map(v=>({k:keyOf(v),v,m:new Set([mi]),per:new Map([[mi,v]])})); return; }
+    const P=lcsPairs(out.map(x=>x.k),sq.map(keyOf)); const res=[]; let i=0,j=0;
+    for(const [pi,pj] of [...P,[out.length,sq.length]]){ while(i<pi) res.push(out[i++]); while(j<pj){ const v=sq[j++]; res.push({k:keyOf(v),v,m:new Set([mi]),per:new Map([[mi,v]])}); } if(pi<out.length){ out[pi].m.add(mi); out[pi].per.set(mi,sq[pj]); res.push(out[pi]); i++; j++; } }
+    out=res; }); return out; }
+function grpTag(S,U,mem,conf){ if(S.size===U.size) return null; const O=[...U].filter(i=>!S.has(i)); const ins=[...S];
+  const cS=new Set(ins.map(i=>mem[i].cls)), cO=new Set(O.map(i=>mem[i].cls)); if([...cS].every(c=>!cO.has(c))) return [...cS].join('/');
+  const rS=new Set(ins.map(i=>grpRace(mem[i].race))), rO=new Set(O.map(i=>grpRace(mem[i].race))); if([...rS].every(c=>!rO.has(c))) return [...rS].join('/');
+  const k=i=>grpRace(mem[i].race)+' '+mem[i].cls; const kO=new Set(O.map(k)); for(const i of ins) if(kO.has(k(i))) conf.add(mem[i].name);
+  return [...new Set(ins.map(k))].join('/'); }
+function condFor(str,r){ const R0=route; route=r; try{ return condOK(str); } finally{ route=R0; } }
+const stepCond=b=>(b.match(/^step\b[ \t]*<<[ \t]*([^\n]*)/)||[])[1]||'';
+const tagStep=(b,t)=>!t?b:b.replace(/^step\b[ \t]*(?:<<[ \t]*([^\n]*?))?[ \t]*(?=\n|$)/,(m0,x)=>x?`step << (${x}) (${t})`:`step << ${t}`);
+async function exportGroupGuide(){ const set=pathSet(); const R0=route,C0=cursor,S0=SIM; const nm0=$('#expName').value; const per=[]; const warns=[];
+  const name=(route.glp&&store.glp?.name)||(set[0].name.replace(/\s*\(.*\)$/,''))||'Group';
+  try{ for(const r of set){ await rawLoad((r.guides||[]).map(g=>g.id)); route=r; cursor=r.steps.length-1; simulate(); $('#expName').value=name; buildRXP(); per.push(LAST_SEGS); EXPORT_WARN.forEach(w=>warns.push(r.name+': '+w)); } }
+  finally{ route=R0; cursor=C0; SIM=S0; $('#expName').value=nm0; }
+  const mem=set.map(r=>({name:r.name,race:r.char.race,cls:r.char.cls,fac:charInfo(r).fac})); const U=new Set(mem.map((x,i)=>i)); const conf=new Set();
+  const fac=new Set(mem.map(m=>m.fac)).size>1?null:(mem[0].fac==='H'?'Horde':'Alliance');
+  const segs=mergeSeqs(per,s=>s.key); const nmS=k=>segs.length===1&&!segs[0].k?name:`${name} ${k+1}${segs[k].k?' - '+segs[k].k:''}`;
+  const group=route.guide?.group||'Forever Routes', extra=route.guide?.extra||'', next=route.guide?.next||''; let tagged=0;
+  const outL=['-- Contains text from RestedXP guides (https://github.com/RestedXP/RXPGuides), licensed CC BY-NC-SA 4.0.','-- If you share this file: credit RestedXP, keep it non-commercial and share it under the same licence.','-- Made with the Forever Route Planner (GPL-3.0). Not affiliated with RestedXP, Blizzard or WoW: Forever.',`-- Group guide for ${mem.map(m=>`${m.name} (${m.race} ${m.cls})`).join(', ')}: steps only some of you do are tagged with << race/class.`,''];
+  segs.forEach((sg,k)=>{ const H=[`RXPGuides.RegisterGuide(${JSON.stringify(group)},[[`]; const ex=extra?extra.split(/\s*;\s*|\n/).filter(Boolean):[]; if(!ex.some(l=>/^#forever\b/i.test(l))) H.push('#forever'); H.push(...ex);
+    const gt=grpTag(sg.m,U,mem,conf); const facT=fac||[...new Set([...sg.m].map(i=>mem[i].fac==='H'?'Horde':'Alliance'))].join('/'); H.push(gt?`<< ${facT} (${gt})`:`<< ${facT}`); H.push(`#name ${nmS(k)}`);
+    const nx=new Map(); for(const i of sg.m){ let t=next; for(let j=k+1;j<segs.length;j++) if(segs[j].m.has(i)){ t=nmS(j); break; } if(t){ if(!nx.has(t)) nx.set(t,new Set()); nx.get(t).add(i); } }
+    if(nx.size===1&&[...nx.values()][0].size===sg.m.size) H.push(`#next ${[...nx.keys()][0]}`); else for(const [t,S] of nx) H.push(`#next ${t} << ${grpTag(S,sg.m,mem,conf)||(fac||'Horde/Alliance')}`);
+    const blocks=mergeSeqs([...sg.m].sort((a,b)=>a-b).map(i=>sg.per.get(i).blocks),b=>b.replace(/[ \t]+$/gm,''));
+    /* mergeSeqs numbers members by position in this list: map back to member idx */ const ord=[...sg.m].sort((a,b)=>a-b);
+    const body=blocks.map(b=>{ const S=new Set([...b.m].map(x=>ord[x])); const X=stepCond(b.v).trim(); const sees=new Set([...sg.m].filter(i=>S.has(i)||!X||condFor(X,set[i]))); /* members the step's own tag already hides need no extra tag */ const t=grpTag(S,sees,mem,conf); if(t) tagged++; return tagStep(b.v,t); });
+    outL.push(...H,...body,']])',''); });
+  const msgs=[`One guide for ${set.length} members: ${mem.map(m=>esc(m.name)+' ('+esc(m.race+' '+m.cls)+')').join(', ')}. ${tagged} step${tagged===1?' is':'s are'} tagged so only the members who do ${tagged===1?'it':'them'} see ${tagged===1?'it':'them'}; everything else is shared.`];
+  if(conf.size) msgs.push(`⚠ ${[...conf].map(esc).join(', ')} share${conf.size===1?'s':''} a race and class with another member, so RestedXP can't tell them apart: they will also see each other's own steps. Export separate guides instead if that matters.`);
+  if(!fac) msgs.push('⚠ The group mixes Horde and Alliance.');
+  $('#dlgPaths').close(); $('#expGroup').value=group; setSeg('#expMode','rxp'); $('#expText').value=outL.join('\n').trim(); $('#expMsg').innerHTML=msgs.map(m=>`<div>${m}</div>`).join('')+warns.slice(0,30).map(w=>`<div>⚠ ${esc(w)}</div>`).join(''); $('#dlgExport').showModal(); }
+/* ---------- group pick-ups: consecutive quest pick-ups in one hub become one step with every quest giver targeted ---------- */
+const grpMode=()=>route.char.grpAcc!==false&&((+route.char.party||1)>1||!!route.member);
+function accRuns(){ const lead=new Map(), mem=new Map(); if(!grpMode()) return {lead,mem};
+  const ok=i=>{ const s=route.steps[i], r=SIM.res[i]; return s&&s.t==='accept'&&!s.src&&s.q&&Q(s.q)&&!s.shared&&!isItemStart(s.q)&&!isSticky(s)&&r&&!r.inactive&&r.pt; };
+  for(let i=0;i<route.steps.length;i++){ if(!ok(i)) continue; const p0=SIM.res[i].pt; const run=[]; let j=i+1;
+    while(j<route.steps.length&&ok(j)){ const p=SIM.res[j].pt; if(Math.hypot(p.X-p0.X,p.Y-p0.Y)>250) break; run.push(j); j++; }
+    if(run.length){ lead.set(i,run); run.forEach(k=>mem.set(k,i)); i=j-1; } }
+  return {lead,mem}; }
+function forkMark(i){ if(!route.group) return ''; const ks=pathSet().filter(r=>r!==route).map(r=>[r,sharedPrefix(route,r)]).filter(([r,k])=>k===i+1&&k<route.steps.length); return ks.length?`<li class="forkmark">⑂ Paths split here: ${ks.map(([r])=>`<span style="color:${r.char.rcol||'inherit'}">${esc(r.name)}</span>`).join(', ')} go their own way after step ${i+1}</li>`:''; }
+/* ---------- section catalog: save a tested section, insert it into other routes ---------- */
+function catSave(){ store.catalog=store.catalog||[]; save(); kvPut('catalog',JSON.stringify(store.catalog)); }
+async function secToCatalog(id){ const S=route.sections?.[id]; if(!S) return; const idx=route.steps.map((x,i)=>x.sec===id?i:-1).filter(i=>i>=0); if(!idx.length) return;
+  store.catalog=store.catalog||[]; const name=await askText('Save to the catalog as:',S.name,'Save','text'); if(name==null) return; const nm=name.trim()||S.name;
+  const ex=store.catalog.find(c=>c.name===nm); if(ex&&!confirm(`Replace the catalog entry “${nm}”?`)) return;
+  const steps=idx.map(i=>{ const st=JSON.parse(JSON.stringify(route.steps[i])); delete st.id; delete st.sec; if(st.src&&!st.src.auto){ const g=G(st.src.g); st.srcG=g?.name||null; st.srcI=st.src.i; } delete st.src; return st; });
+  const R0=SIM.res[idx[0]], R1=SIM.res[idx[idx.length-1]]; const lv=a=>a?+(a.level+(a.level<MAXLVL?a.xp/XP_TABLE[a.level]:0)).toFixed(1):null;
+  const e={id:ex?.id||uid(),name:nm,color:S.color,steps,from:{route:route.name,faction:route.char.faction,race:route.char.race,cls:route.char.cls},l0:lv(R0?.before),l1:lv(R1?.after),t:secStats({from:idx[0],to:idx[idx.length-1]}).t,saved:Date.now()};
+  if(ex) Object.assign(ex,e); else store.catalog.push(e); catSave(); toast(`Saved “${nm}” (${steps.length} steps) to the catalog. Use Catalog to add it to any route.`,4000); }
+function catInsert(cid){ const e=(store.catalog||[]).find(c=>c.id===cid); if(!e) return; pushHistory(); route.sections=route.sections||{}; const sid=uid(); route.sections[sid]={name:e.name,color:e.color||SEC_COLS[0],cut:false,col:false,cat:e.id};
+  let kept=0; const steps=e.steps.map(x=>{ const st=JSON.parse(JSON.stringify(x)); st.id=uid(); st.sec=sid; if(st.srcG){ const g=(route.guides||[]).find(g=>g.name===st.srcG); const gs=g?.steps[st.srcI]; if(gs&&gs.t===st.t&&(gs.q||null)===(st.q||null)){ st.src={g:g.id,i:st.srcI}; kept++; } } delete st.srcG; delete st.srcI; return st; });
+  route.steps.splice(cursor+1,0,...steps); const at=cursor+1; cursor+=steps.length; refresh(); scrollCursor();
+  const wrongF=e.from?.faction&&e.from.faction!==route.char.faction; toast(`Added “${e.name}” as steps ${at+1}–${cursor+1}${kept?` (${kept} linked to your imported guide)`:''}.${wrongF?' Note: it was made for the other faction.':''} Check the Health report for anything that doesn't fit this lead-up.`,6000); $('#dlgCat').close(); }
+function openCatalog(){ const L=store.catalog||[]; const ci=charInfo(route);
+  $('#catBody').innerHTML=L.length?`<table class="ptab"><tr><th>Section</th><th>Levels</th><th>Steps</th><th>Made with</th><th></th></tr>${L.map(e=>`<tr><td><b style="color:${e.color||'inherit'}">${esc(e.name)}</b><br><span class="note">${e.t?fmtT(e.t)+' · ':''}saved ${new Date(e.saved).toLocaleDateString()}</span></td><td>${e.l0??'?'} → ${e.l1??'?'}</td><td>${e.steps.length}</td><td class="note">${esc([e.from?.race,e.from?.cls].filter(Boolean).join(' '))}${e.from?.faction&&e.from.faction!==route.char.faction?' <b style="color:#e0533d">other faction</b>':''}<br>${esc(e.from?.route||'')}</td><td style="white-space:nowrap"><button class="btn sm gold" data-cat="ins:${e.id}">Add after step ${cursor+1}</button><button class="btn sm" data-cat="ren:${e.id}">✎</button><button class="btn sm" data-cat="del:${e.id}">🗑</button></td></tr>`).join('')}</table>`:'<p class="note">The catalog is empty. Make a section in a route, then use 📚 on its header to save it here.</p>';
+  if(!$('#dlgCat').open) $('#dlgCat').showModal(); }
+document.addEventListener('click',async e=>{ const b=e.target.closest('[data-cat]'); if(!b) return; const [a,id]=b.dataset.cat.split(':'); const c=(store.catalog||[]).find(x=>x.id===id);
+  if(a==='ins') catInsert(id); else if(a==='del'&&c&&confirm(`Delete “${c.name}” from the catalog?`)){ store.catalog=store.catalog.filter(x=>x!==c); catSave(); openCatalog(); } else if(a==='ren'&&c){ const v=await askText('Catalog name:',c.name,'Rename','text'); if(v!=null&&v.trim()){ c.name=v.trim(); catSave(); } openCatalog(); } });
+function blockAction(a){ const idx=[...selSteps].sort((x,y)=>x-y); if(!idx.length) return;
+  if(a==='ypk'){ askText(`Kills on the way for these ${idx.length} steps: 1 kill every … yards (0 = none, empty = route setting${route.char.ypk?' of '+route.char.ypk:''})`,'0','Set','text').then(v=>{ if(v==null) return; pushHistory(); const t=v.trim(); for(const i of idx){ const st=route.steps[i]; if(t===''||!(+t>=0)) delete st.ypk; else st.ypk=+t; } refresh(); toast(t===''?'Using the route setting again':`Set on ${idx.length} steps`); }); return; }
+  if(a==='clear'){ selSteps.clear(); renderSteps(); return; }
+  if(a==='sec'){ makeSection(idx); return; }
+  if(a==='topaths'){ const others=pathSet().filter(r=>r!==route); const n=copyToPaths(idx.map(i=>route.steps[i]),route.steps[idx[0]-1]||null,others); toast(n?`Copied ${idx.length} steps to ${others.map(r=>r.name).join(', ')}.`:'No other paths in this set.'); return; }
+  if(a==='del'){ pushHistory(); const del=new Set(idx); idx.forEach(i=>markRemoved(route.steps[i])); const before=idx.filter(i=>i<=cursor).length; route.steps=route.steps.filter((_,i)=>!del.has(i)); cursor=Math.max(-1,cursor-before); selSteps.clear(); refresh(); toast(`Deleted ${idx.length} steps`); return; }
+  if(a==='up'){ if(idx[0]===0) return; moveBlock(idx,idx[0]-1); return; }
+  if(a==='down'){ const last=idx[idx.length-1]; if(last>=route.steps.length-1) return; moveBlock(idx,last+2); return; }
+  if(a==='cursor'){ askMoveAfter(idx); } }
+async function askMoveAfter(idx){ const v=await askText(`Move the ${idx.length} selected steps to just after step number:`,String(cursor+1),'Move'); if(v==null) return; const n=parseInt(v); if(!(n>=0&&n<=route.steps.length)) return toast('Enter a step number between 0 and '+route.steps.length);
+  if(idx.includes(n-1)&&!idx.includes(n)) return; moveBlock(idx,n); }
+$('#steps').addEventListener('click',e=>{
+  if(e.target.closest('a.wh')){ e.stopPropagation(); return; }
+  const pe=e.target.closest('[data-pathed]'); if(pe){ e.stopPropagation(); startPathEdit(+pe.dataset.pathed); return; }
+  const sh=e.target.closest('[data-shr]'); if(sh){ e.stopPropagation(); const s=route.steps[+sh.dataset.shr]; pushHistory(); s.shared=!s.shared; if(!s.shared) delete s.shared; refresh(); toast(s.shared?'Shared by a party member: no need to visit the quest giver':'Picked up from the quest giver'); return; }
+  const ng=e.target.closest('[data-nogrp]'); if(ng){ e.stopPropagation(); const st=route.steps[+ng.dataset.nogrp]; pushHistory(); if(st.nogrp) delete st.nogrp; else st.nogrp=true; refresh(); return; }
+  const sb=e.target.closest('[data-sec]'); if(sb){ e.stopPropagation(); const [a,id]=sb.dataset.sec.split(':'); secAction(a,id); return; }
+  if(e.target.closest('.sechdr')) return;
+  const nw=e.target.closest('[data-now]'); if(nw) return;
+  const sk=e.target.closest('[data-stk]'); if(sk){ e.stopPropagation(); const s=route.steps[+sk.dataset.stk]; pushHistory(); s.stk=s.stk==null||s.stk===false?'next':s.stk==='next'?'sticky':false; refresh(); toast(s.stk==='next'?'Sticky: done together with the next step':s.stk==='sticky'?'Sticky: stays on screen until done':'Not sticky'); return; }
+  const ed=e.target.closest('[data-edit]'); if(ed){ e.stopPropagation(); editStep(+ed.dataset.edit); return; }
+  const ux=e.target.closest('[data-uxp]'); if(ux){ e.stopPropagation(); askUXP(route.steps[+ux.dataset.uxp]); return; }
+  const bb=e.target.closest('[data-blk]'); if(bb){ e.stopPropagation(); blockAction(bb.dataset.blk); return; }
+  const dgs=e.target.closest('[data-dgsel]'); if(dgs){ e.stopPropagation(); selectDungeon(dgs.dataset.dgsel,e.ctrlKey||e.metaKey||e.shiftKey); return; }
+  if(e.target.closest('.selbar')) return;
+  if(e.target.closest('details.tspd')) return;
+  const d=e.target.closest('[data-del]'); if(d){ e.stopPropagation(); removeStep(+d.dataset.del); return; }
+  const ob=e.target.closest('[data-opt]'); if(ob){ e.stopPropagation(); const i=+ob.dataset.opt; pushHistory(); route.steps[i].opt=!route.steps[i].opt; refresh(); return; }
+  const fg=e.target.closest('[data-fixgrind]'); if(fg){ e.stopPropagation(); const [i,l]=fg.dataset.fixgrind.split(':').map(Number); pushHistory(); route.steps.splice(i,0,{t:'grind',mode:'to',level:l,xp:0,note:'Catch up to level '+l}); if(cursor>=i) cursor++; refresh(); toast('Grind to level '+l+' added'); return; }
+  const li=e.target.closest('[data-i]'); if(!li) return; const i=+li.dataset.i;
+  if(e.shiftKey){ const a=selAnchor??cursor; selSteps=new Set(); for(let k=Math.min(a,i);k<=Math.max(a,i);k++) if(k>=0) selSteps.add(k); selAnchor=a; renderSteps(); return; }
+  if(e.ctrlKey||e.metaKey){ if(!selSteps.size&&cursor>=0) selSteps.add(cursor); selSteps.has(i)?selSteps.delete(i):selSteps.add(i); selAnchor=i; renderSteps(); return; }
+  if(selSteps.size){ selSteps.clear(); } selAnchor=i; setCursor(i);
+  const s=route.steps[i]; if(s&&s.q&&Q(s.q)){ selQuest=s.q; renderRight(); requestDraw(); }
+});
+$('#steps').addEventListener('dblclick',async e=>{ const li=e.target.closest('[data-i]'); if(!li) return; const s=route.steps[+li.dataset.i];
+  if(s&&s.q&&!Q(s.q)&&s.t==='turnin'){ askUXP(s); return; } if(s&&s.t==='buy'){ openBuy(+li.dataset.i); return; } if(s&&s.t==='train'){ pickTrainer(+li.dataset.i); return; } if(s&&['grind','travel','custom'].includes(s.t)) openStepDialog(s.t,+li.dataset.i); });
+let pathEdit=null, pathDrag=null, pathHits=[];
+function ownPath(s){ if(!s.path) s.path=(pathOf(s)||[]).map(l=>({...l})); delete s.loopRaw; s.pathSrc='edited'; return s.path; }
+function pathDelPt(k){ const s=route.steps[pathEdit]; if(pathOf(s).length<=2) return toast('A path needs at least 2 points: use Remove path instead'); pushHistory(); ownPath(s).splice(k,1); refresh(); }
+function pathClick(x,y){ const s=route.steps[pathEdit]; const h=pathHits.find(h=>Math.hypot(h.x-x,h.y-y)<10); if(h) return true;
+  const P=pathHits; let best=-1,bd=12; for(let k=0;k<P.length;k++){ const a=P[k], b=P[(k+1)%P.length]; const dx=b.x-a.x, dy=b.y-a.y, L=dx*dx+dy*dy||1; const t=Math.max(0,Math.min(1,((x-a.x)*dx+(y-a.y)*dy)/L)); const d=Math.hypot(a.x+t*dx-x,a.y+t*dy-y); if(d<bd){bd=d;best=k;} }
+  if(best<0) return false; pushHistory(); const path=ownPath(s); const X=(x-view.tx)/view.s, Y=(y-view.ty)/view.s; path.splice(best+1,0,planeToZp(path[best].z,X,Y)); refresh(); return true; }
+function startPathEdit(i){ const s=route.steps[i]; if(!pathOf(s)){ pushHistory(); const p=genPath(s.q,s.obj,routeRefBefore(i)); if(!p) return toast('Not enough spawn points to build a path for this objective'); s.path=p; s.pathSrc='generated'; refresh(); }
+  pathEdit=i; closePanels&&closePanels(); const pts=SIM.res[i]?.path||[]; if(pts.length){ const xs=pts.map(p=>p.X), ys=pts.map(p=>p.Y); const bw=Math.max(60,Math.max(...xs)-Math.min(...xs)), bh=Math.max(60,Math.max(...ys)-Math.min(...ys)); flyTo((Math.min(...xs)+Math.max(...xs))/2,(Math.min(...ys)+Math.max(...ys))/2,Math.min(8,Math.min(W/(bw*2.2),H/(bh*2.2)))); }
+  $('#pathbar').style.display='flex'; $('#pathMsg').textContent=`Path for step ${i+1}${stepGuide(s)&&!s.path?' (from the guide: editing makes it your own)':''}: drag points · click the line to add one · right-click a point to remove it`; requestDraw(); }
+function stopPathEdit(){ pathEdit=null; pathDrag=null; $('#pathbar').style.display='none'; requestDraw(); }
+function editStep(i){ const s=route.steps[i], r=SIM.res[i]||{}; const d=$('#dlgEdit');
+  const own=!s.src&&s.t==='travel'&&(s.kind==='note'||s.kind==='goto'); $('#edTextL').hidden=!own; $('#edText').value=own?(s.text||''):'';
+  $('#edTitle').textContent='Edit step '+(i+1); $('#edNote').value=s.unote||''; $('#edXp').value=s.xpo!=null?s.xpo:''; $('#edYpk').value=s.ypk!=null?s.ypk:''; const canPart=s.t==='complete'&&s.obj&&Q(s.q)&&s.obj<100; $('#edUptoL').hidden=!canPart; $('#edUpto').value=s.upto||''; $('#edYpk').placeholder=route.char.ypk?'route: '+route.char.ypk:'route: off';
+  const calc=s.xpo!=null?r.xpCalc:r.gained; $('#edXp').placeholder=String(calc||0); $('#edXpHint').textContent=`Planner's estimate: ${fmt(calc||0)} XP. Leave empty to use it.`+(s.t==='grind'&&s.mode==='to'?' Setting XP here replaces the level target with that amount of XP.':'');
+  const done=v=>{ d.close(); if(!v) return; pushHistory();
+    if(v==='reset'){ delete s.unote; delete s.xpo; delete s.ypk; delete s.upto; delete s.pin; }
+    else { const n=$('#edNote').value.replace(/\s+$/,''); if(n) s.unote=n; else delete s.unote; const x=$('#edXp').value.trim(); if(x!==''&&+x>=0) s.xpo=Math.round(+x); else delete s.xpo; const yk=$('#edYpk').value.trim(); if(yk!==''&&+yk>=0) s.ypk=+yk; else delete s.ypk; if(!$('#edUptoL').hidden){ const u=parseInt($('#edUpto').value); if(u>0) s.upto=u; else delete s.upto; } if(own){ const t=$('#edText').value.trim(); if(t) s.text=t; } }
+    refresh(); };
+  const pth=pathOf(s), canPath=s.t==='complete'&&s.q; $('#edPathRow').hidden=!canPath;
+  if(canPath){ $('#edPathInfo').textContent=pth?`Path: ${pth.length} points (${s.path?(s.pathSrc==='generated'?'generated':s.pathSrc==='edited'?'edited by you':'from '+s.pathSrc):'from the guide, exported as is'})`:'No path: the arrow points at one spot.'; $('#edPathRm').hidden=!s.path; $('#edPathGen').textContent=pth?'Regenerate':'Make path'; }
+  $('#edPathEdit').onclick=()=>{ d.close(); startPathEdit(i); };
+  const locInfo=()=>{ const p=s.pin||(r.pt&&r.pt.z!=null?r.pt:null); $('#edLocInfo').textContent='Location: '+(p?zoneName(p.z)+' '+(+p.px).toFixed(1)+', '+(+p.py).toFixed(1):'none')+(s.pin?' (set by you)':' (default)'); $('#edLocRm').hidden=!s.pin; };
+  $('#edLocRow').hidden=!pinnable(s); if(pinnable(s)) locInfo();
+  $('#edLocSet').onclick=()=>startPick('#dlgEdit',l=>{ if(!l) return; pushHistory(); s.pin=l; refresh(); locInfo(); });
+  $('#edLocRm').onclick=()=>{ pushHistory(); delete s.pin; refresh(); locInfo(); };
+  $('#edPathGen').onclick=()=>{ const p=genPath(s.q,s.obj,routeRefBefore(i)); if(!p) return toast('Not enough spawn points to build a path for this objective'); d.close(); pushHistory(); s.path=p; delete s.loopRaw; s.pathSrc='generated'; refresh(); startPathEdit(i); };
+  $('#edPathRm').onclick=()=>{ d.close(); pushHistory(); if(stepGuide(s)?.path) s.path=null; else delete s.path; delete s.loopRaw; delete s.pathSrc; if(pathEdit===i) stopPathEdit(); refresh(); };
+  $('#edOk').onclick=()=>done('ok'); $('#edNo').onclick=()=>done(null); $('#edReset').onclick=()=>done('reset'); d.showModal(); setTimeout(()=>$('#edNote').focus(),0); }
+async function askUXP(s){ { const v=await askText(`XP reward for ${s.qn||'quest '+s.q} (at your level):`,String(route.qxp?.[s.q]||'')); if(v==null) return; pushHistory(); route.qxp=route.qxp||{}; if(+v>0) route.qxp[s.q]=Math.round(+v); else delete route.qxp[s.q]; refresh(); } }
+let dragFrom=null;
+$('#steps').addEventListener('dragstart',e=>{ const li=e.target.closest('.step'); if(!li) return; dragFrom=+li.dataset.i; e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain',String(dragFrom)); });
+$('#steps').addEventListener('dragover',e=>{ const li=e.target.closest('.step'); if(!li||dragFrom===null) return; e.preventDefault(); $$('.step.dragover').forEach(x=>x.classList.remove('dragover')); li.classList.add('dragover'); });
+$('#steps').addEventListener('drop',e=>{ const li=e.target.closest('.step'); $$('.step.dragover').forEach(x=>x.classList.remove('dragover')); if(!li||dragFrom===null) return; e.preventDefault(); const to=+li.dataset.i;
+  if(selSteps.size>1&&selSteps.has(dragFrom)){ if(!selSteps.has(to)) moveBlock([...selSteps],to); } else { selSteps.clear(); moveStep(dragFrom,to); } dragFrom=null; });
+$('#steps').addEventListener('dragend',()=>{ dragFrom=null; $$('.step.dragover').forEach(x=>x.classList.remove('dragover')); });
+
+function renderXP(){
+  const st=SIM.st; const need=st.level<MAXLVL?XP_TABLE[st.level]:1; const pct=st.level<MAXLVL?st.xp/need*100:100;
+  $('#lvl').innerHTML=`${st.level}<small>${cursor<0?'at start':'after step '+(cursor+1)}</small>`;
+  $('#xpfill').style.width=pct+'%';
+  $('#xplbl').textContent=st.level<MAXLVL?`${fmt(st.xp)} / ${fmt(need)} XP (${pct.toFixed(0)}%)`:'Level 60';
+  { const tc=cursor>=0?SIM.res[cursor]?.tAt||0:0; $('#played').innerHTML=`/played ≈ <b>${fmtT(tc)}</b> · 💰 ≈ <b>${fmtG(SIM.st.money)}</b>`; $('#played').title=`Estimated time played by the end of step ${cursor+1}: walking/flying between steps, kills × time to kill (your DPS vs mob HP and armor, plus downtime) and talking. Set DPS and downtime in Settings. Route total ≈ ${fmtT(SIM.end.t)}.\nMoney: coins + vendor value of everything your kills drop (objective, travel and grind kills; CMaNGOS classic-db loot tables), quest money and reward items at vendor value (best choice item; Forever quests estimated from their level), minus class training, learning professions (10s) and vendor purchases. Flights, repairs and recipe training are not counted. Route end ≈ ${fmtG(SIM.end.money)}.`; }
+  const e=SIM.end; const quests=route.steps.filter(s=>s.t==='turnin').length; const endL=e.level+(e.level<MAXLVL?e.xp/XP_TABLE[e.level]:0);
+  $('#groupSel').value=String(SIM.st.party||1);
+  $('#xpsum').innerHTML=`Route end: <b>level ${endL.toFixed(2)}</b> · ${quests} turn-ins · ${SIM.st.log.size+[...(SIM.st.fq||new Map()).values()].filter(v=>v!=='done').length}/${LOGMAX} in log · /played ≈ ${fmtT(SIM.end.t)} · 💰 ≈ ${fmtG(SIM.end.money)}`;
+}
+function renderRouteHead(){
+  $('#routeSel').innerHTML=store.routes.map(r=>`<option value="${r.id}" ${r.id===route.id?'selected':''}>${r.group?'⑂ ':''}${esc(r.name)}</option>`).join(''); { const pb=$('#pathsBtn'); if(pb) pb.textContent=route.group?`Paths (${pathSet().length})`:'Paths'; }
+  const c=route.char; $('#whoBtn').innerHTML=`<b>${esc(c.race)} ${esc(c.cls)}</b> · ${c.faction==='H'?'Horde':'Alliance'}`;
+  const no=route.steps.filter(s=>s.opt).length; $('#routeInfo').innerHTML=`${route.steps.length} steps · starts at level ${c.level}`+(no?` · <label style="display:inline-flex;gap:4px;align-items:center"><input type="checkbox" id="optCount" ${route.optOff?'':'checked'}> count ${no} optional</label>`:'');
+  const oc=document.getElementById('optCount'); if(oc) oc.onchange=()=>{ route.optOff=!oc.checked; refresh(); };
+  const tags=new Map(); route.steps.forEach((_,i)=>stepDgTags(i).forEach(t=>tags.set(t,(tags.get(t)||0)+1)));
+  if(tags.size){ const sel=document.createElement('select'); sel.id='dgPick'; sel.title='Select every step for a dungeon'; sel.style.cssText='margin-left:6px;font-size:12px;max-width:150px';
+    sel.innerHTML='<option value="">Select dungeon steps…</option>'+[...tags].map(([t,n])=>`<option value="${esc(t)}">${esc(t)} (${n})</option>`).join('');
+    sel.onchange=()=>{ if(sel.value) selectDungeon(sel.value); sel.value=''; }; $('#routeInfo').appendChild(sel); }
+}
+
+/* ---------- right panel ---------- */
+let tab='avail';
+$$('.tabs button').forEach(b=>b.addEventListener('click',()=>{ tab=b.dataset.tab; renderRight(); }));
+$('#availFilter').addEventListener('input',()=>renderRight());
+$('#availZone').addEventListener('change',()=>renderRight());
+function rootsHTML(a){ return a.roots.map(r=>{ const q=Q(r); const w=whyUnavailable(r,SIM.st,route); return `<a href="#" data-q="${r}" class="lk">${esc(q.n)}</a> <span class="note">[${q.l}]${w&&w.level?' lvl '+w.level:''}</span>${w?'':` <button class="btn sm" data-accept="${r}" title="Accept the prerequisite">Accept</button>`}`; }).join(' · '); }
+function lockRow(a){ const q=Q(a.qid); const dc=diffClass(q.l,SIM.st.level); const xp=questXP(a.qid,SIM.st.level);
+  return `<div class="qrow locked ${selQuest===a.qid?'sel':''}" data-q="${a.qid}"><span class="lv c-${dc}">${q.l}</span><span class="nm"><span class="c-${dc}">🔒 ${esc(q.n)}</span> <span class="meta">${xp?'+'+fmt(xp)+' XP':''}${isDungeonQuest(a.qid)?' · <span class="dgtxt">dungeon</span>':''}</span><br><span class="meta">Needs: ${rootsHTML(a)}</span></span></div>`; }
+function qRow(qid,extra,locked){
+  const q=Q(qid); const lv=SIM.st.level; const dc=locked?'grey':diffClass(q.l,lv); const xp=questXP(qid,Math.max(lv,locked||0));
+  return `<div class="qrow ${selQuest===qid?'sel':''}" data-q="${qid}"><span class="lv c-${dc}">${q.l}</span><span class="nm"><span class="c-${dc}">${esc(q.n)}</span><br><span class="meta">${extra||(xp?'+'+fmt(xp)+' XP':'no XP data')}${isDungeonQuest(qid)?' · <span class="dgtxt">dungeon</span>':''}</span></span>${locked?'':`<button class="btn sm" data-accept="${qid}">Accept</button>`}</div>`;
+}
+function renderRight(){
+  $$('.tabs button').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.tab===tab)));
+  $('#availHead').hidden=tab!=='avail';
+  const body=$('#rightBody');
+  if(tab==='avail'){
+    const f=$('#availFilter').value.trim().toLowerCase(); const zf=$('#availZone').value; const lv=SIM.st.level;
+    const near=SIM.near; const groups={}; const zonesSeen=new Set();
+    for(const a of SIM.avail){
+      const q=Q(a.qid); const zl=areaLabel(q); zonesSeen.add(zl);
+      if(f && !q.n.toLowerCase().includes(f) && String(a.qid)!==f) continue;
+      if(zf==='near'){ if(!near) continue; const sp=starterPts(a.qid); if(!(sp.some(p=>p.z===near.z)||zl===zoneName(near.z))) continue; }
+      else if(zf && zl!==zf) continue;
+      const key=a.locked?(diffClass(q.l,lv)==='grey'?'Low level':zl):!a.ok?'Unlocks soon':(diffClass(q.l,lv)==='grey'?'Low level':zl);
+      (groups[key]=groups[key]||[]).push(a);
+    }
+    const sel=$('#availZone'); const keep=sel.value;
+    sel.innerHTML=`<option value="">All zones</option><option value="near">Near this step</option>`+[...zonesSeen].sort().map(z=>`<option ${z===keep?'selected':''}>${esc(z)}</option>`).join('');
+    if(keep==='near') sel.value='near';
+    const ref=near?.pt; const dist=k=>{ if(!ref) return 0; let b=1e18; for(const a of groups[k]) for(const p of starterPts(a.qid).slice(0,3)){ const d=(p.X-ref.X)**2+(p.Y-ref.Y)**2; if(d<b) b=d; } return b; };
+    const dk={}; for(const k in groups) dk[k]=dist(k);
+    const order=Object.keys(groups).sort((a,b)=>{ const rank=k=>k==='Needs a prerequisite'?1:k==='Unlocks soon'?2:k==='Low level'?3:0; if(rank(a)!==rank(b)) return rank(a)-rank(b); return dk[a]-dk[b]; });
+    let html=''; let n=0;
+    for(const k of order){ const list=groups[k].sort((a,b)=>(!!a.locked-!!b.locked)||Q(a.qid).l-Q(b.qid).l||Q(a.qid).n.localeCompare(Q(b.qid).n)); n+=list.length;
+      html+=`<div class="qgroup"><h3>${esc(k)} (${list.length})</h3>${list.slice(0,150).map(a=>a.ok?qRow(a.qid):a.locked?lockRow(a):qRow(a.qid,'Unlocks at level '+a.level,a.level)).join('')}</div>`; }
+    { const fl=fqAvail(SIM.st,true).filter(a=>!f||a.e.n.toLowerCase().includes(f)||String(a.e.q)===f).sort((a,b)=>a.e.l-b.e.l||a.e.n.localeCompare(b.e.n)); if(!foreverQuests().size) {} else { const hid=fqHidden(SIM.st).filter(h=>!f||h.e.n.toLowerCase().includes(f)); html=`<div class="qgroup"><h3>Forever quests from your guides only (${fl.length})</h3><p class="note" style="margin:2px 0 6px">Not in Questie's Forever data (${META.fqbRev||'?'}) yet: locations and objectives come from the guides you imported.</p>${fl.slice(0,150).map(fqRow).join('')}${hid.length?`<details style="margin:4px 0"><summary class="note" style="cursor:pointer">Not shown at this step (${hid.length})</summary>${hid.map(h=>`<div class="note" style="margin:2px 0 2px 10px">${esc(h.e.n)}: ${esc(h.why)}</div>`).join('')}</details>`:''}</div>`+html; } }
+    body.innerHTML=html||`<div class="empty">No quests match. Try another zone filter, or add a grind step to reach the next unlock level.</div>`;
+  } else if(tab==='log'){
+    const st=SIM.st; const fqRows=fqAvail(st).filter(a=>a.f).map(fqRow).join(''); const rows=[...st.log].map(([qid,v])=>{ const q=Q(qid); if(!q) return ''; const dc=diffClass(q.l,st.level);
+      return `<div class="qrow ${selQuest===qid?'sel':''}" data-q="${qid}"><span class="lv c-${dc}">${q.l}</span><span class="nm"><span class="c-${dc}">${esc(q.n)}</span><br><span class="meta">${v.done?'Ready to turn in':'In progress'} · ${esc(areaLabel(q))}</span>${v.done?'':objChecklist(qid,v)}</span><span class="row" style="flex-wrap:nowrap">${v.done?'':`<button class="btn sm" data-complete="${qid}">Done</button>`}<button class="btn sm" data-turnin="${qid}">Turn in</button></span></div>`; });
+    const nf=fqAvail(st).filter(a=>a.f).length; body.innerHTML=`<div class="qgroup"><h3>Quest log at this step (${st.log.size+nf}/${LOGMAX})</h3>${rows.join('')+fqRows||'<div class="empty">Your quest log is empty at this step.</div>'}</div>`;
+  } else if(tab==='guides'){ body.innerHTML=renderGuides(); afterGuidesRender(); } else body.innerHTML=renderDetail();
+}
+function renderDetail(){
+  const qid=selQuest; const q=qid&&Q(qid);
+  if(!q) return `<div class="empty">Select a quest on the map, in a list, or with search to see its details.</div>`;
+  const st=SIM.st; const w=whyUnavailable(qid,st,route); const inLog=st.log.get(qid);
+  const sp=starterPts(qid)[0], fp=finisherPts(qid)[0];
+  const loc=p=>p?`${esc(p.label)} · ${esc(zoneName(p.z))} ${(+p.px).toFixed(1)}, ${(+p.py).toFixed(1)}${p.dg?' (dungeon)':''}`:'Unknown';
+  const itemStart=q.s.i.map(i=>DB.i[i]?.n||('Item '+i));
+  const pre=[...(q.pg||[]),...(q.ps||[])].filter(Q);
+  let act='';
+  if(st.stkT?.has(qid)) act+=`<button class="btn gold" data-tinnow="${qid}">Turn in now</button>`;
+  if(inLog){ act+=accNowBtn(qid); if(hasObjectives(qid)) act+=`<button class="btn" data-complete="${qid}">${inLog.done?'Add another complete step':'Mark objectives done'}</button>`; if(!st.stkT?.has(qid)) act+=`<button class="btn gold" data-turnin="${qid}">Turn in</button>`; }
+  else if(!w) act+=`<button class="btn gold" data-accept="${qid}">Accept</button>`;
+  else if(!st.turned.has(qid)) act+=`<button class="btn" data-accept="${qid}">Accept anyway</button>`;
+  const obs=objectives(qid);
+  return `<div class="detail"><h2>${esc(q.n)}</h2><div class="note">Quest ${qid} · ${whLink(qid)}</div>
+  ${w?`<div class="reason">${esc(w.why)}</div>`:''}
+  <dl class="facts"><dt>Level</dt><dd><span class="c-${diffClass(q.l,st.level)}">${q.l}</span> (requires ${q.r})</dd>
+  <dt>XP now</dt><dd>${q.xe?'<span class="note" title="Questie has no XP for Forever quests yet: estimated from the quest level">≈ </span>':''}${q.xp?fmt(questXP(qid,st.level))+' of '+fmt(isDungeonQuest(qid)?q.xp[1]*dqMult():q.xp[1])+(isDungeonQuest(qid)?` <span class="dgtxt">(dungeon: Era ${fmt(q.xp[1])} × ${dqMult()})</span>`:''):'No XP data'}</dd>
+  <dt>Zone</dt><dd>${esc(areaLabel(q))}</dd>
+  <dt>Starts</dt><dd>${itemStart.length?'From item: '+esc(itemStart.join(', ')):loc(sp)}</dd>
+  <dt>Ends</dt><dd>${loc(fp)}</dd></dl>
+  ${q.t?`<p>${esc(q.t)}</p>`:''}
+  ${obs.length?`<b>Objectives</b><ul>${obs.map(o=>`<li>${esc(o.text)}${o.pts.length?'':' <span class="note">(no map data)</span>'}</li>`).join('')}</ul>`:'<p class="note">No objectives; talk to the quest ender.</p>'}
+  ${pre.length?`<p class="note">Follows: ${pre.map(p=>`<button class="linkish" data-sel="${p}">${esc(Q(p).n)}</button>`).join(', ')}</p>`:''}
+  ${q.nx&&Q(q.nx)?`<p class="note">Leads to: <button class="linkish" data-sel="${q.nx}">${esc(Q(q.nx).n)}</button></p>`:''}
+  <div class="row" style="margin-top:10px">${act}<button class="btn" data-show="${qid}">Show on map</button></div></div>`;
+}
+document.addEventListener('click',e=>{
+  const t=e.target.closest('[data-hgrind],[data-tinnow],[data-cnow],[data-accnow],[data-ride],[data-flynode],[data-fpnode],[data-cobj],[data-accept],[data-complete],[data-turnin],[data-sel],[data-show],[data-q],[data-fp],[data-fly],[data-home],[data-hs],[data-goto]'); if(!t||t.closest('#steps')) return;
+  if(t.tagName==='A') e.preventDefault();
+  const d=t.dataset;
+  if(d.cnow){ const [q,n]=d.cnow.split(':').map(Number); addStep(n?{t:'complete',q,obj:n,stk:false}:{t:'complete',q,stk:false}); hidePop(); }
+  else if(d.cobj){ const [q,n]=d.cobj.split(':').map(Number); addStep({t:'complete',q,obj:n}); hidePop(); }
+  else if(d.accept){ addStep({t:'accept',q:+d.accept}); hidePop(); }
+  else if(d.hgrind){ const id=+d.hgrind, m=HEATSEL?.c.mobs.find(x=>x.nid===id); const nm=META.mobl?.n?.[id]||('NPC '+id); hidePop(); openStepDialog('grind',null,{loc:HEATSEL?.loc,mlevel:Math.round(m?.lv||SIM.st.level),note:'Grind '+nm,mobs:[nm]}); }
+  else if(d.tinnow){ const k=SIM.st.stkT?.get(+d.tinnow); if(k!=null) stepNow(k,cursor+1); hidePop(); }
+  else if(d.accnow){ const k=stickyAccIdx(+d.accnow); if(k>=0) stepNow(k,cursor+1); hidePop(); }
+  else if(d.complete){ addStep({t:'complete',q:+d.complete}); hidePop(); }
+  else if(d.turnin){ addStep({t:'turnin',q:+d.turnin}); hidePop(); }
+  else if(d.flynode){ addStep({t:'travel',kind:'fly',node:d.flynode,text:taxiShort(d.flynode)}); hidePop(); }
+  else if(d.fpnode){ addStep({t:'travel',kind:'fp',node:d.fpnode,text:taxiShort(d.fpnode)}); hidePop(); }
+  else if(d.fp){ addStep({t:'travel',kind:'fp',text:d.fp,loc:JSON.parse(d.loc)}); hidePop(); }
+  else if(d.fly){ addStep({t:'travel',kind:'fly',text:d.fly,loc:JSON.parse(d.loc)}); hidePop(); }
+  else if(d.home){ addStep({t:'travel',kind:'home',text:d.home,loc:JSON.parse(d.loc)}); hidePop(); }
+  else if(d.hs){ addStep({t:'travel',kind:'hs',text:d.hs,loc:JSON.parse(d.loc)}); hidePop(); }
+  else if(d.ride){ const rd=RIDES[+d.ride]; addStep({t:'travel',kind:'ride',ride:rd.id,text:rd.text}); hidePop(); }
+  else if(d.goto){ addStep({t:'travel',kind:'goto',text:d.goto,loc:JSON.parse(d.loc)}); hidePop(); }
+  else if(d.sel){ selectQuest(+d.sel); }
+  else if(d.show){ showQuestOnMap(+d.show); }
+  else if(d.q){ selectQuest(+d.q,true); }
+});
+function selectQuest(qid,center){ selQuest=qid; tab='detail'; renderRight(); if(center) showQuestOnMap(qid,true); requestDraw(); }
+function showQuestOnMap(qid,soft){
+  const pts=[...starterPts(qid).slice(0,2),...finisherPts(qid).slice(0,2),...objectives(qid).flatMap(o=>o.pts)].filter(p=>!p.dg);
+  if(!pts.length) return toast('No map position for this quest');
+  const xs=pts.map(p=>p.X), ys=pts.map(p=>p.Y); const x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys);
+  const s=Math.min(0.5,W/Math.max(400,(x1-x0)*1.4),H/Math.max(300,(y1-y0)*1.4));
+  if(soft){ const [sx,sy]=toS({X:(x0+x1)/2,Y:(y0+y1)/2}); if(sx>60&&sx<W-60&&sy>60&&sy<H-60&&view.s>0.04) { requestDraw(); return; } }
+  flyTo((x0+x1)/2,(y0+y1)/2,Math.max(s,0.04));
+}
+
+/* ---------- popups ---------- */
+function hidePop(){ $('.pop')?.remove(); }
+function showPop(h,x,y){
+  hidePop(); const st=SIM.st; const lv=st.level; let html=h.kind==='heat'?h.html:'';
+  const locAttr=l=>`data-loc='${esc(JSON.stringify(l))}'`;
+  if(h.kind==='quest'){
+    html+=`<h4>${esc(h.label)}</h4>`;
+    for(const q of h.turn){ const v=st.log.get(q); html+=`<div class="it"><b>${esc(Q(q).n)}</b> <span class="note">${v.done?'ready':'in progress'} · +${fmt(questXP(q,lv))} XP</span><div class="row">${hasObjectives(q)?`<button class="btn sm" data-complete="${q}">${v.done?'Complete again':'Objectives done'}</button>`:''}${accNowBtn(q,true)}${st.stkT?.has(q)?`<button class="btn sm gold" data-tinnow="${q}" title="You have a sticky hand-in at step ${st.stkT.get(q)+1}; add the step where it must be handed in">Turn in now</button>`:`<button class="btn sm gold" data-turnin="${q}">Turn in</button>`}<button class="btn sm" data-sel="${q}">Details</button>${whLink(q,true)}</div></div>`; }
+    for(const q of h.stkT||[]){ html+=`<div class="it"><b>${esc(Q(q).n)}</b> <span class="note">📌 sticky turn-in at step ${(SIM.st.stkT?.get(q)??0)+1}: if you can on the way</span><div class="row"><button class="btn sm gold" data-tinnow="${q}" title="Add a normal turn-in step here: the sticky one becomes 'if you can on the way'">Turn in now</button><button class="btn sm" data-sel="${q}">Details</button></div></div>`; }
+    for(const q of h.avail){ const dc=diffClass(Q(q).l,lv); html+=`<div class="it"><span class="c-${dc}">[${Q(q).l}] ${esc(Q(q).n)}</span> <span class="note">+${fmt(questXP(q,lv))} XP</span><div class="row"><button class="btn sm gold" data-accept="${q}">Accept</button><button class="btn sm" data-sel="${q}">Details</button>${whLink(q,true)}</div></div>`; }
+    for(const a of h.locked||[]){ const q=a.qid; html+=`<div class="it"><span class="c-${diffClass(Q(q).l,lv)}">🔒 [${Q(q).l}] ${esc(Q(q).n)}</span> <span class="note">+${fmt(questXP(q,lv))} XP</span><div class="note">Needs: ${rootsHTML(a)}</div><div class="row"><button class="btn sm" data-sel="${q}">Details</button>${whLink(q,true)}</div></div>`; }
+    for(const q of h.sel||[]) html+=`<div class="it">${esc(Q(q).n)}<div class="row"><button class="btn sm" data-sel="${q}">Details</button>${whLink(q,true)}</div></div>`;
+    if(h.npcLoc) html+=`<div class="it"><div class="row">${flyBtn(h.npcLoc)}<button class="btn sm" data-goto="${esc(h.label)}" ${locAttr({z:h.npcLoc.z,px:h.npcLoc.px,py:h.npcLoc.py})}>Go to</button></div></div>`;
+  } else if(h.kind==='obj'){
+    const q=h.qids[0]; html+=`<h4>${esc(Q(q).n)}</h4><div class="it">${esc(h.obText)}<br><span class="note">${esc(h.label||'')}</span>${h.stk?`<div class="note">📌 Sticky: done on the way if you can</div>`:''}<div class="row">${h.stk?`<button class="btn sm gold" data-cnow="${q}:${h.obRx||0}" title="Add a normal complete step here: the earlier sticky step becomes 'if you can on the way'">Complete now</button>`:''}${h.obRx&&objNums(q).length>1?`<button class="btn sm gold" data-cobj="${q}:${h.obRx}">This objective done</button><button class="btn sm" data-complete="${q}">All objectives done</button>`:`<button class="btn sm gold" data-complete="${q}">Objectives done</button>`}<button class="btn sm" data-sel="${q}">Details</button>${whLink(q,true)}</div></div>`;
+  } else if(h.kind==='fp'){
+    html+=fpHTML(h);
+  } else if(h.kind==='town'){
+    html+=townHTML(h);
+  } else if(h.kind==='fq'){ html+=fqPopHTML(h.q);
+  } else if(['ptrainer','gy','trainer','vendor'].includes(h.kind)){ html+=svcHTML(h);
+  } else if(h.kind==='dock'){
+    html+=`<h4>${esc(h.dock.label)}</h4>`+h.rides.map(r=>`<div class="it"><div class="row"><button class="btn sm gold" data-ride="${r.id}">${esc(r.text)}</button></div></div>`).join('');
+  } else if(h.kind==='ghost'){ html=ghostPopHTML(h);
+  } else if(h.kind==='dungeon'||h.kind==='dgobj'){
+    const qs=h.kind==='dgobj'?h.qids:[...st.log.keys()].filter(q=>objectives(q).some(o=>o.pts.some(p=>p.dg&&h.p&&Math.abs(p.X-h.p.X)<5&&Math.abs(p.Y-h.p.Y)<5)));
+    html+=`<h4>${esc(h.label)}</h4>`;
+    if(!qs.length) html+=`<div class="it note">Dungeon entrance. Accept a quest with objectives inside and it will be listed here.</div>`;
+    for(const q of qs){ const v=st.log.get(q); html+=`<div class="it"><b>${esc(Q(q).n)}</b> <span class="note">${v&&v.done?'objectives done':'objectives inside'}</span>${objChecklist(q,v)}<div class="row">${v&&!v.done?`<button class="btn sm gold" data-complete="${q}">All objectives done</button>`:''}${v?`<button class="btn sm" data-turnin="${q}">Turn in</button>`:''}<button class="btn sm" data-sel="${q}">Details</button>${whLink(q,true)}</div></div>`; }
+  }
+  { const seen=new Set(h.kind==='fq'?[h.q]:[]); for(const t of hits) if(t.kind==='fq'&&!seen.has(t.q)&&Math.hypot(t.x-x,t.y-y)<=t.r+6){ seen.add(t.q); html+=`<hr style="border:0;border-top:1px solid var(--line);margin:6px 0">`+fqPopHTML(t.q); } }
+  { const SV=['ptrainer','gy','trainer','vendor']; const near=hits.filter(t=>t!==h&&SV.includes(t.kind)&&Math.hypot(t.x-x,t.y-y)<=t.r+8); const seen=new Set(); for(const t of near){ const k=t.kind+(t.pid||t.gi||t.tid||t.vid); if(seen.has(k)||(h.kind===t.kind&&(h.pid||h.gi||h.tid||h.vid)===(t.pid||t.gi||t.tid||t.vid))) continue; seen.add(k); html+=`<hr style="border:0;border-top:1px solid var(--line);margin:6px 0">`+svcHTML(t); } }
+  for(const t of hits) if((t.kind==='fp'||t.kind==='dock')&&t!==h&&!(h.kind===t.kind)&&Math.hypot(t.x-x,t.y-y)<=t.r+8){ html+=`<hr style="border:0;border-top:1px solid var(--line);margin:6px 0">`+(t.kind==='fp'?fpHTML(t):`<h4>${esc(t.dock.label)}</h4>`+t.rides.map(r=>`<div class="it"><div class="row"><button class="btn sm gold" data-ride="${r.id}">${esc(r.text)}</button></div></div>`).join('')); break; }
+  if(h.kind!=='town'){ const tw=hits.find(t=>t.kind==='town'&&Math.hypot(t.x-x,t.y-y)<=t.r+10); if(tw) html+=`<hr style="border:0;border-top:1px solid var(--line);margin:6px 0">`+townHTML(tw); }
+  const div=document.createElement('div'); div.className='pop'; div.innerHTML=html; $('#mapwrap').appendChild(div);
+  const w=div.offsetWidth, hh=div.offsetHeight; div.style.left=Math.max(6,Math.min(W-w-6,x+12))+'px'; div.style.top=Math.max(6,Math.min(H-hh-6,y+12))+'px';
+  $('#tip').style.display='none';
+}
+function fqPopHTML(q){ const e=foreverQuests().get(q); const f=fqStatus(q); return `<h4>${esc(e.n)}</h4><div class="it">${e.txt?`<div>${esc(e.txt)}</div>`:''}<span class="note">Forever quest · ${e.qie?'from Questie (no objectives yet)':'from '+esc(e.g)}${e.lv?' · level '+e.lv:''}${e.req?' · needs '+e.req:''}${e.tgtA?' · '+esc(e.tgtA):''}</span><div class="row">${f?'':`<button class="btn sm gold" data-fqa="accept:${e.q}">Accept</button>`}${f==='log'?accNowBtn(e.q,true):''}${f==='log'||f==='ready'?fqObjBtns(e):''}${f?`<button class="btn sm gold" data-fqa="turnin:${e.q}">Turn in${e.tgtT?' to '+esc(e.tgtT):''}</button>`:''}<a class="btn sm" href="${whURL(e.q,e.n)}" target="_blank" rel="noopener">Wowhead</a></div></div>`; }
+function svcHTML(h){ let html='';
+  if(h.kind==='ptrainer'){ const t=ptrainerOf(h.pid); html+=`<h4>${esc(t.name)}</h4><div class="it"><span class="note">${esc(t.sub)}</span><div class="row"><button class="btn sm gold" data-prof="learn:${t.id}">Learn ${esc(t.prof)}</button><button class="btn sm" data-prof="train:${t.id}">Train ${esc(t.prof)}</button><button class="btn sm" data-prof="craft:${t.id}">Craft…</button></div></div>`;
+  } else if(h.kind==='gy'){ html+=`<h4>Spirit Healer</h4><div class="it"><span class="note">${esc(zoneName(gyAt(h.gi).z))} graveyard</span><div class="row"><button class="btn sm gold" data-dsk="${h.gi}">Die and res here</button></div></div>`;
+  } else if(h.kind==='trainer'){ const t=trainerOf(h.tid); const own=t.cls===route.char.cls; html+=`<h4>${esc(t.name)}</h4><div class="it"><span class="note">${esc(t.cls)} trainer</span>${own?trainList(t.id,SIM.st.level,prevTrainLevel(cursor+1)):''}<div class="row"><button class="btn sm gold" data-train="${t.id}">Train class spells here</button></div></div>`;
+  } else if(h.kind==='vendor'){ const v=vendorOf(h.vid);
+    html+=`<h4>${esc(v.name)}</h4><div class="it"><span class="note">${esc(v.sub||'Vendor')}${v.items.length?' · sells '+v.items.slice(0,6).map(i=>esc(itemName(i))).join(', ')+(v.items.length>6?'…':''):''}</span><div class="row"><button class="btn sm gold" data-buyv="${v.id}">Buy from ${esc(v.name)}</button></div></div>`;
+  }
+  return html; }
+function fpHTML(h){ let html='';
+    const node=Object.entries(META.taxi.nodes).find(([id,n])=>n.fm===h.npc)?.[0]; const place=guessPlace(h.loc);
+    html+=`<h4>${esc(h.label)}</h4><div class="it">${node?`<span class="note">${esc(META.taxi.nodes[node].n)}${SIM.st.fps.has(node)?' · learned':''}</span>`:''}<div class="row">${node?`<button class="btn sm gold" data-fpnode="${node}">Get flight path</button><button class="btn sm" data-flynode="${node}">Fly here</button>`:`<button class="btn sm gold" data-fp="${esc(place)}" ${locAttr(h.loc)}>Get flight path</button><button class="btn sm" data-fly="${esc(place)}" ${locAttr(h.loc)}>Fly here</button>`}</div></div>`;
+  return html; }
+function townHTML(h){ const locAttr=l=>`data-loc='${esc(JSON.stringify(l))}'`; return `<h4>${esc(h.label)}</h4><div class="it"><div class="row"><button class="btn sm" data-home="${esc(h.label)}" ${locAttr(h.loc)}>Set hearthstone</button><button class="btn sm" data-hs="${esc(h.label)}" ${locAttr(h.loc)}>Hearth here</button><button class="btn sm" data-goto="${esc(h.label)}" ${locAttr(h.loc)}>Go here</button>${flyBtn(zp2plane(h.loc.z,h.loc.px,h.loc.py))}</div></div>`; }
+function flyBtn(p){ if(!p||!META.taxi) return ''; const id=nearestNode(p); if(!id) return ''; return `<button class="btn sm" data-flynode="${id}" title="Adds a .fly step to the nearest flight path">Fly to ${esc(taxiShort(id))}</button>`; }
+function guessPlace(loc){ let best=null,bd=1e18; const p=zp2plane(loc.z,loc.px,loc.py); for(const [z,x,y,n] of META.towns){ const t=zp2plane(z,x,y); if(!t) continue; const d=(t.X-p.X)**2+(t.Y-p.Y)**2; if(d<bd){bd=d;best=n;} } for(const [z,Z] of Object.entries(META.zones)){ if(!Z.city) continue; const t=zp2plane(z,50,50); const d=(t.X-p.X)**2+(t.Y-p.Y)**2; if(d<bd){bd=d;best=Z.n;} } return bd<1200*1200?best:zoneName(loc.z); }
+
+/* ---------- search ---------- */
+let qIndex=null; let resSel=0;
+$('#search').addEventListener('input',()=>{ const v=$('#search').value.trim().toLowerCase(); const box=$('#results'); if(v.length<2){ box.hidden=true; return; }
+  qIndex=qIndex||Object.entries(DB.q).map(([id,q])=>[+id,q.n.toLowerCase()]);
+  const res=qIndex.filter(([id,n])=>n.includes(v)||String(id)===v).slice(0,40);
+  resSel=0; box.innerHTML=res.map(([id],i)=>{ const q=Q(id); const w=whyUnavailable(id,SIM.st,route); const status=SIM.st.turned.has(id)?'done':SIM.st.log.has(id)?'in log':w?(w.hard?'n/a':'locked'):'available';
+    return `<button data-pick="${id}" class="${i===0?'hi':''}"><span class="c-${diffClass(q.l,SIM.st.level)}" style="min-width:24px">${q.l}</span><span style="flex:1">${esc(q.n)}<br><span class="note">${esc(areaLabel(q))} · ${status}</span></span></button>`; }).join('')||'<div class="empty">No quests found.</div>';
+  box.hidden=false; });
+$('#search').addEventListener('keydown',e=>{ const btns=$$('#results button'); if(!btns.length) return;
+  if(e.key==='ArrowDown'||e.key==='ArrowUp'){ e.preventDefault(); resSel=(resSel+(e.key==='ArrowDown'?1:-1)+btns.length)%btns.length; btns.forEach((b,i)=>b.classList.toggle('hi',i===resSel)); btns[resSel].scrollIntoView({block:'nearest'}); }
+  else if(e.key==='Enter'){ btns[resSel].click(); } else if(e.key==='Escape'){ $('#results').hidden=true; } });
+$('#results').addEventListener('click',e=>{ const b=e.target.closest('[data-pick]'); if(!b) return; $('#results').hidden=true; $('#search').value=''; selectQuest(+b.dataset.pick); showQuestOnMap(+b.dataset.pick); openPanel('right'); });
+document.addEventListener('click',e=>{ if(!e.target.closest('.search')) $('#results').hidden=true; });
+
+/* ---------- dialogs ---------- */
+function openStepDialog(kind,editIndex,pre){
+  const dlg={grind:'#dlgGrind',travel:'#dlgTravel',custom:'#dlgCustom'}[kind]; const d=$(dlg); const f=d.querySelector('form');
+  const s=editIndex!=null?route.steps[editIndex]:null; let loc=s?.loc||pre?.loc||null; const mobs=s?.mobs||pre?.mobs||null;
+  const locEl=d.querySelector('[id$="Loc"]'); const showLoc=()=>locEl.textContent=loc?`${zoneName(loc.z)} ${loc.px}, ${loc.py}`:'No location'; showLoc();
+  d._setLoc=l=>{ loc=l; showLoc(); };
+  f.reset();
+  const lv=SIM.st.level;
+  if(kind==='grind'){ setSeg('#grindMode',s?.mode||'add'); { const j=s?.mode==='by'?route.steps.findIndex(x=>x.id===s.at):-1; f.blevel.value=s?.mode==='by'?s.level:Math.min(60,lv+1); f.bxp.value=s?.mode==='by'?(s.xp||0):0; f.bstep.value=j>=0?j+1:(editIndex!=null?editIndex+2:Math.min(route.steps.length,cursor+2)); } f.amount.value=s?.amount||''; f.src.value=s?.src||'mobs'; f.tlevel.value=s?.level||Math.min(60,lv+1); f.txp.value=s?.xp||0; f.note.value=s?.note||pre?.note||''; f.mlevel.value=pre?.mlevel||lv; f.kills.value=''; updEst(); }
+  if(kind==='travel'){ f.kind.value=s?.kind||'fly'; f.text.value=s?.text||''; fillNodeSel(f,s?.node||(s?resolveNode(s):null)); }
+  if(kind==='custom'){ f.name.value=s?.name||''; f.xp.value=s?.xp||''; f.qid.value=s?.qid||''; f.act.value=s?.act||'turnin'; }
+  d.querySelector('.gold').textContent=s?'Save step':'Add step';
+  f.onsubmit=null;
+  d.onclose=()=>{ if(d.returnValue!=='ok'||d._picking) return; let step;
+    if(kind==='grind'){ const m=$('#grindMode [aria-pressed="true"]').dataset.m; if(m==='by'){ const n=Math.max(1,+f.bstep.value||1); const tgt=route.steps[n-1]; /* step number as shown before this grind is added */ step={t:'grind',mode:'by',level:Math.max(1,Math.min(60,+f.blevel.value||lv+1)),xp:Math.max(0,+f.bxp.value||0),at:tgt?.id||null,note:f.note.value}; } else step=m==='to'?{t:'grind',mode:'to',level:Math.max(1,Math.min(60,+f.tlevel.value||lv+1)),xp:Math.max(0,+f.txp.value||0),note:f.note.value}:{t:'grind',mode:'add',amount:Math.max(0,+f.amount.value||0),src:f.src.value,note:f.note.value}; }
+    if(kind==='travel'){ step={t:'travel',kind:f.kind.value,text:f.text.value}; if((step.kind==='fly'||step.kind==='fp')&&f.node.value){ step.node=f.node.value; step.text=taxiShort(step.node); loc=null; } }
+    if(kind==='custom') step={t:'custom',name:f.name.value||'Custom quest',xp:+f.xp.value||0,qid:+f.qid.value||null,act:f.act.value};
+    if(loc) step.loc=loc; if(kind==='grind'&&mobs) step.mobs=mobs;
+    if(s){ pushHistory(); route.steps[editIndex]=step; refresh(); } else addStep(step);
+  };
+  d.showModal();
+}
+function setSeg(sel,m){ $$(sel+' button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.m===m))); if(sel==='#grindMode') $$('#dlgGrind [data-gm]').forEach(el=>el.hidden=el.dataset.gm!==m); if(sel==='#expMode') $$('#dlgExport [data-exp]').forEach(el=>el.hidden=el.dataset.exp!==m); }
+$('#grindMode').addEventListener('click',e=>{ const b=e.target.closest('button'); if(b) setSeg('#grindMode',b.dataset.m); });
+function updEst(){ const f=$('#grindForm'); const party=SIM.st.party||1; const per=mobXP(SIM.st.level,+f.mlevel.value||1,f.elite.checked,party,f.dgmob.checked?killCfg().dg:0); const n=+f.kills.value||0; $('#estOut').textContent=`${fmt(per)} XP per kill at level ${SIM.st.level}${party>1?` in a group of ${party}`:' solo'} → ${fmt(per*n)} XP`; return per*n; }
+['mlevel','kills','elite','dgmob'].forEach(n=>$('#grindForm')[n].addEventListener('input',updEst));
+$('#estUse').addEventListener('click',()=>{ $('#grindForm').amount.value=updEst(); });
+function startPick(dlgSel,cb){ const d=$(dlgSel); d._picking=true; d.close('pick'); d._picking=false; picking=l=>{ cb(l); d.showModal(); }; canvas.classList.add('picking'); $('#pickbar').style.display='flex'; closePanels(); }
+function stopPick(){ picking=null; canvas.classList.remove('picking'); $('#pickbar').style.display='none'; }
+let buyCtx=null;
+function openBuy(i,vid){ const s=i!=null?route.steps[i]:null; buyCtx={i,vid:s?s.npc:(vid!=null?+vid:null),items:new Map((s?.items||[]).map(it=>[it.id?String(it.id):'n:'+it.n,{...it}]))};
+  $('#buyFind').value=''; $('#buyOther').value=''; $('#buyOtherId').value=''; $('#buyOtherN').value='1'; $('#buyMsg').textContent=''; $('#buyOk').textContent=s?'Save':'Add step'; renderBuy(); $('#dlgBuy').showModal(); }
+function renderBuy(){ const ref=routeRefBefore(buyCtx.i!=null?buyCtx.i:cursor+1); const f=$('#buyFind').value.trim().toLowerCase();
+  let L=Object.keys(META.vend||{}).map(vendorOf).filter(v=>vendorOK(v)&&(!f||v.name.toLowerCase().includes(f)||(v.sub||'').toLowerCase().includes(f)||v.items.some(i=>itemName(i).toLowerCase().includes(f))));
+  const dist=v=>{ if(!ref) return 0; let b=1e18; for(const p of vendorPts(v)) b=Math.min(b,Math.hypot(p.X-ref.X,p.Y-ref.Y)); return b; };
+  L=L.map(v=>({v,d:dist(v)})).sort((a,b)=>a.d-b.d).slice(0,12); if(buyCtx.vid!=null&&!L.some(x=>x.v.id===buyCtx.vid)){ const v=vendorOf(buyCtx.vid); if(v) L.unshift({v,d:dist(v)}); }
+  $('#buyVendors').innerHTML=L.map(({v,d})=>`<button type="button" data-bv="${v.id}" aria-pressed="${v.id===buyCtx.vid}"><b>${esc(v.name)}</b> <span class="note">${esc(v.sub||'')} · ${esc(zoneName(v.sp[0][0]))}${ref?' · '+fmt(Math.round(d))+' yd':''}</span></button>`).join('')||'<span class="note">No vendors match.</span>';
+  const v=buyCtx.vid!=null?vendorOf(buyCtx.vid):null; const rows=[];
+  if(v) for(const id of v.items){ const k=String(id), it=buyCtx.items.get(k); rows.push(`<label class="buyi"><input type="checkbox" data-bi="${k}" ${it?'checked':''}> <span style="flex:1">${esc(itemName(id))}</span> <input type="number" min="1" data-bn="${k}" value="${it?it.c:1}"></label>`); }
+  for(const [k,it] of buyCtx.items) if(!v||!v.items.includes(+k)) rows.push(`<label class="buyi"><input type="checkbox" data-bi="${esc(k)}" checked> <span style="flex:1">${esc(it.n||itemName(it.id))}${it.id?'':' <span class="note">(no item ID: shown as text only)</span>'}</span> <input type="number" min="1" data-bn="${esc(k)}" value="${it.c}"></label>`);
+  $('#buyItems').innerHTML=v?(`<div class="note">${v.items.length?'Items this vendor sells (from Questie):':'Questie lists no items for this vendor: add them below.'}</div>`+rows.join('')):(rows.join('')||'<div class="note">Pick a vendor.</div>'); }
+$('#buyBtn').addEventListener('click',()=>openBuy(null,null));
+function addTrain(id){ const t=id!=null?trainerOf(id):nearestTrainer(routeRefBefore(cursor+1)); if(!t) return toast(`No ${route.char.cls} trainer found for your faction`); addStep({t:'train',npc:t.id,npcName:t.name}); if(id==null) toast(`Train at ${t.name} (${zoneName(t.sp[0][0])}), the nearest ${t.cls} trainer. Double-click the step to pick another.`,4500); }
+$('#trainBtn').addEventListener('click',()=>addTrain(null));
+$('#dieBtn').addEventListener('click',()=>addDeath(null));
+document.addEventListener('click',e=>{ const b=e.target.closest('[data-prof]'); if(!b) return; hidePop(); const [a,id]=b.dataset.prof.split(':'); addProf(+id,a); });
+document.addEventListener('click',e=>{ const b=e.target.closest('[data-dsk]'); if(!b) return; hidePop(); addDeath(+b.dataset.dsk); });
+document.addEventListener('click',e=>{ const b=e.target.closest('[data-train]'); if(!b) return; hidePop(); addTrain(+b.dataset.train); });
+async function pickTrainer(i){ const s=route.steps[i]; const ref=routeRefBefore(i); const L=myTrainers().map(t=>({t,d:ref?Math.min(...trainerPts(t).map(p=>Math.hypot(p.X-ref.X,p.Y-ref.Y))):0})).sort((a,b)=>a.d-b.d).slice(0,9);
+  const v=await askText('Pick a trainer by number:\n'+L.map((x,k)=>`${k+1}. ${x.t.name} · ${zoneName(x.t.sp[0][0])}${ref?' · '+fmt(Math.round(x.d))+' yd':''}`).join('\n'),'1','Use'); const k=parseInt(v)-1; if(!(k>=0&&k<L.length)) return; pushHistory(); s.npc=L[k].t.id; s.npcName=L[k].t.name; refresh(); }
+$('#buyFind').addEventListener('input',renderBuy);
+$('#buyVendors').addEventListener('click',e=>{ const b=e.target.closest('[data-bv]'); if(!b) return; buyCtx.vid=+b.dataset.bv; renderBuy(); });
+$('#buyItems').addEventListener('change',e=>{ const c=e.target.closest('[data-bi]'), n=e.target.closest('[data-bn]'); const k=(c||n)?.dataset.bi||(c||n)?.dataset.bn; if(!k) return;
+  const cb=$(`#buyItems [data-bi="${CSS.escape(k)}"]`), nn=$(`#buyItems [data-bn="${CSS.escape(k)}"]`); const c0=Math.max(1,parseInt(nn.value)||1);
+  if(n&&!cb.checked) cb.checked=true; if(cb.checked){ const old=buyCtx.items.get(k); buyCtx.items.set(k,{...(old||{}),...(k.startsWith('n:')?{}:{id:+k,n:itemName(+k)}),c:c0}); } else buyCtx.items.delete(k); });
+$('#buyOtherAdd').addEventListener('click',()=>{ const n=$('#buyOther').value.trim(), id=parseInt($('#buyOtherId').value)||null, c=Math.max(1,parseInt($('#buyOtherN').value)||1); if(!n&&!id) return; const k=id?String(id):'n:'+n; buyCtx.items.set(k,{id,n:n||itemName(id),c}); $('#buyOther').value=''; $('#buyOtherId').value=''; renderBuy(); });
+$('#buyNo').addEventListener('click',()=>$('#dlgBuy').close());
+$('#buyOk').addEventListener('click',()=>{ if(buyCtx.vid==null){ $('#buyMsg').textContent='Pick a vendor first.'; return; } if(!buyCtx.items.size){ $('#buyMsg').textContent='Tick at least one item.'; return; }
+  const v=vendorOf(buyCtx.vid); const step={t:'buy',npc:v.id,npcName:v.name,items:[...buyCtx.items.values()].map(it=>({id:it.id||null,n:it.n||itemName(it.id),c:it.c}))}; $('#dlgBuy').close();
+  if(buyCtx.i!=null){ pushHistory(); Object.assign(route.steps[buyCtx.i],step); refresh(); } else addStep(step); });
+document.addEventListener('click',e=>{ const b=e.target.closest('[data-fqa]'); if(!b) return; e.stopPropagation(); hidePop(); const [t,q,n,now]=b.dataset.fqa.split(':'); const st=fqStep(t,+q,n?+n:null); if(st){ if(now) st.stk=false; addStep(st); if(t==='turnin'&&!route.qxp?.[+q]) toast('Set its XP reward with “Set XP” on the step if you know it.',4000); } });
+document.addEventListener('click',e=>{ const b=e.target.closest('[data-buyv]'); if(!b) return; hidePop(); openBuy(null,+b.dataset.buyv); });
+$('#pathDone').addEventListener('click',stopPathEdit); document.addEventListener('keydown',e=>{ if(e.key==='Escape'&&pathEdit!=null) stopPathEdit(); });
+$('#pickCancel').addEventListener('click',()=>{ const cb=picking; stopPick(); cb&&cb(null); });
+[['#grindPick','#dlgGrind'],['#travelPick','#dlgTravel'],['#customPick','#dlgCustom']].forEach(([b,d])=>$(b).addEventListener('click',()=>startPick(d,l=>{ if(l) $(d)._setLoc(l); })));
+// dialog close via 'pick' should not add step: returnValue 'pick' != 'ok'
+$('#addGrind').addEventListener('click',()=>openStepDialog('grind'));
+$('#addTravel').addEventListener('click',()=>openStepDialog('travel'));
+const SOURCE_URL='https://github.com/tyba-dev/WoWF-QRP'; // set to the project's GitHub address when it is published
+$('#aboutBtn').addEventListener('click',()=>{ $('#aboutSrc').innerHTML=SOURCE_URL?`Source code: <a href="${SOURCE_URL}" target="_blank" rel="noopener">${esc(SOURCE_URL)}</a>.`:'The full source is this page itself (View Source).'; $('#dlgAbout').showModal(); });
+$('#aboutClose').addEventListener('click',()=>$('#dlgAbout').close());
+$('#restoreBtn').addEventListener('click',async()=>{ const db=await rawDB(); const keys=(await kvKeys()).filter(k=>String(k).startsWith('backup:')).sort().reverse(); const list=$('#backupList');
+  if(!keys.length){ list.textContent='No backups yet.'; } else { const rows=[]; for(const k of keys){ const t=await kvGet(k); let st=null; try{ st=JSON.parse(t); }catch(e){} if(!st) continue; rows.push(`<div class="it" style="padding:6px 0;border-top:1px solid var(--line)"><b>${esc(k.slice(7))}</b>: ${st.routes.map(r=>esc(r.name)+' ('+(r.steps||[]).length+' steps)').join(', ')} <button class="btn sm" data-restore="${esc(k)}">Restore</button></div>`); } list.innerHTML=rows.join(''); }
+  $('#dlgBackup').showModal(); });
+$('#backupList').addEventListener('click',async e=>{ const b=e.target.closest('[data-restore]'); if(!b) return; const st=JSON.parse(await kvGet(b.dataset.restore)); let n=0;
+  for(const r of st.routes){ const nr=migrateRoute({...r,id:uid(),name:r.name+' (backup '+b.dataset.restore.slice(7)+')'}); for(const g of nr.guides||[]) if(g.raw) rawPut(g.id,g.raw); store.routes.push(nr); n++; }
+  route=store.routes[store.routes.length-1]; cursor=route.steps.length-1; history=[]; refresh(); $('#dlgBackup').close(); $('#dlgChar').close(); toast(`Restored ${n} route${n>1?'s':''} from ${b.dataset.restore.slice(7)}`); });
+$('#backupClose').addEventListener('click',()=>$('#dlgBackup').close());
+function renderHS(){ const b=$('#hsBtn'); if(!b||!SIM) return; const h=SIM.st.home;
+  b.innerHTML=h?`Hearth → ${esc(h.label||'?')}`:'Hearth'; b.title=h?`Adds a "Use hearthstone" step after the selected step. At this point your hearthstone is set to ${h.label||'?'}${h.def?' (where your character first spawned: add a Set hearthstone step to change it)':h.step!=null?' (set at step '+(h.step+1)+')':''}.`:'Adds a "Use hearthstone" step. Your hearthstone hasn\u2019t been set in this route yet by this point; add a "Set hearthstone" step (click an inn or town on the map) first.'; }
+$('#hsBtn').addEventListener('click',()=>{ const h=SIM.st.home; addStep({t:'travel',kind:'hs',text:h?.label||'Hearthstone'}); if(!h) toast('Hearthstone not set yet at this point: add a Set hearthstone step before it'); });
+$('#addCustom').addEventListener('click',()=>openStepDialog('custom'));
+$('#undoBtn').addEventListener('click',undo);
+document.addEventListener('keydown',e=>{ if((e.ctrlKey||e.metaKey)&&e.key==='z'&&!e.target.closest('input,textarea')){ e.preventDefault(); undo(); } if(e.key==='Escape') hidePop(); });
+
+function fillRaces(f){ const fac=f.faction.value; f.race.innerHTML=Object.entries(RACES).filter(([n,[b,fa]])=>!fa||fa===fac).map(([n])=>`<option>${n}</option>`).join(''); }
+function openChar(){ const f=$('#charForm'); const c=route.char; { const fresh=!route.steps.length&&!route.group; $('#grpSetup').hidden=!fresh; $('#grpRows').innerHTML=''; } f.name.value=route.name; f.faction.value=c.faction; fillRaces(f); f.race.value=c.race; f.cls.innerHTML=Object.keys(CLASSES).map(n=>`<option>${n}</option>`).join(''); f.cls.value=c.cls; f.level.value=c.level; f.xp.value=c.xp; f.party.value=c.party; f.rep.checked=!!c.rep; f.prof.checked=!!c.prof; f.event.checked=!!c.event; $('#dgSettings').innerHTML=dungeonChecks('dgset'); f.xprate.value=c.xprate||1; f.dqmult.value=c.dqmult||2.5; fillFpSettings(c); f.killxp.checked=c.killxp!==false; f.droprate.value=c.droprate||60; f.defcount.value=c.defcount||8; f.dgdiv.value=c.dgdiv||3.5; f.ypk.value=c.ypk||''; f.explore.checked=c.explore!==false; f.ypkUntil.value=c.ypkUntil||40; f.dpsl.value=c.dpsl||''; f.autoGrp.checked=c.autoGrp!==false; f.autoStk.checked=c.autoStk!==false; f.grpAcc.checked=c.grpAcc!==false; f.grpYd.value=c.grpYd||''; f.kdown.value=c.kdown??''; f.kdown.placeholder=String(defDown()); f.calStep.value=cursor>=0?cursor+1:''; f.calLvl.value=''; f.calXp.value=''; $('#calMsg').textContent=''; $('#dlgChar').showModal(); }
+$('#charForm').faction.addEventListener('change',e=>{ fillRaces(e.target.form); const keep=$$('#fpSettings [data-fpk]').filter(x=>x.checked).map(x=>x.dataset.fpk); fillFpSettings({faction:e.target.value,fps:keep,allfps:$('#fpAll').checked}); });
+$('#calBtn').addEventListener('click',()=>{ const f=$('#charForm'); const i=(+f.calStep.value||0)-1, L=+f.calLvl.value, X=+f.calXp.value||0; if(!(i>=0&&i<route.steps.length)||!(L>=1)) { $('#calMsg').textContent='Enter a step number, and your real level and XP at that step.'; return; }
+  const party=route.char.party; route.char.party=Math.max(1,+f.party.value||1); route.char.ypkUntil=Math.max(2,+f.ypkUntil.value||40); const r=calibrateYpk(i,L,X); route.char.party=party;
+  if(r.err){ $('#calMsg').textContent=r.err; return; } f.ypk.value=r.ypk; $('#calMsg').textContent=`1 kill every ${r.ypk} yards makes step ${i+1} land on level ${L} with ${fmt(X)} XP. Save to use it.`; });
+$('#dlgChar').addEventListener('close',()=>{ if($('#dlgChar').returnValue!=='ok') return; const f=$('#charForm'); const who0=[route.char.faction,route.char.race,route.char.cls].join('|'); const cls0=route.char.cls;
+  route.name=f.name.value||'Route'; Object.assign(route.char,{faction:f.faction.value,race:f.race.value,cls:f.cls.value,level:Math.max(1,Math.min(60,+f.level.value||1)),xp:Math.max(0,+f.xp.value||0),party:Math.max(1,Math.min(5,+f.party.value||1)),rep:f.rep.checked,prof:f.prof.checked,event:f.event.checked});
+  const prev={...(route.char.dungeons||{})}; const next={}; $$('#dgSettings [data-dgset]').forEach(cb=>{ if(cb.checked) next[cb.dataset.dgset]=true; });
+  route.char.xprate=Math.max(0.5,Math.min(5,+f.xprate.value||1)); pruneXpRate(); route.char.fps=$$('#fpSettings [data-fpk]').filter(x=>x.checked).map(x=>x.dataset.fpk); route.char.allfps=$('#fpAll').checked; route.char.dqmult=Math.max(0.1,Math.min(10,+f.dqmult.value||2.5)); route.char.killxp=f.killxp.checked; route.char.droprate=Math.max(5,Math.min(100,+f.droprate.value||60)); route.char.defcount=Math.max(1,+f.defcount.value||8); route.char.dgdiv=Math.max(0.1,+f.dgdiv.value||3.5); route.char.ypk=Math.max(0,+f.ypk.value||0); route.char.explore=f.explore.checked; route.char.ypkUntil=Math.max(2,Math.min(60,+f.ypkUntil.value||40)); route.char.dpsl=+f.dpsl.value>0?+f.dpsl.value:''; route.char.autoGrp=f.autoGrp.checked; route.char.autoStk=f.autoStk.checked; route.char.grpAcc=f.grpAcc.checked; route.char.grpYd=+f.grpYd.value>0?+f.grpYd.value:''; route.char.kdown=f.kdown.value===''?'':Math.max(0,+f.kdown.value);
+  if(cls0!==route.char.cls&&(!route.char.rcol||route.char.rcol===CLS_COL[cls0])) route.char.rcol=CLS_COL[route.char.cls]; route.char.dungeons=next; const turnedOn=Object.keys(next).some(t=>!prev[t]); if(turnedOn) insertNewlyEnabled();
+  if(!$('#grpSetup').hidden){ const ms=grpRowsRead(); if(ms.length){ const lead=route; lead.group=lead.group||uid(); lead.member=true; const n=ms.length+1; lead.char.party=Math.max(+lead.char.party||1,n); lead.char.rcol=lead.char.rcol||CLS_COL[lead.char.cls];
+      ms.forEach((m,k)=>{ const x=newRoute({name:m.name||('Member '+(k+2)),char:JSON.parse(JSON.stringify({...lead.char,race:m.race,cls:m.cls}))}); x.char.rcol=CLS_COL[m.cls]||PATH_COLS[(k+1)%PATH_COLS.length]; x.group=lead.group; x.member=true; store.routes.push(x); });
+      store.pathSync=store.pathSync||{}; toast(`Group of ${n} created: each member has their own path (Paths button). Build each one, then line them up where you meet.`,6000); } $('#grpRows').innerHTML=''; $('#grpSetup').hidden=true; }
+  refresh();
+  if(who0!==[route.char.faction,route.char.race,route.char.cls].join('|')&&(route.guides||[]).length) reapplyGuides().then(n=>toast(`Guides re-read for a ${route.char.race} ${route.char.cls}: ${n} step${n===1?'':'s'} for this character added; steps for other races/classes are crossed out.`,5000)); });
+$('#charBtn').addEventListener('click',openChar); $('#whoBtn').addEventListener('click',openChar);
+$('#stepFind').addEventListener('input',()=>{ findPos=-1; runFind(); if(findHits.length) findGo(1); });
+$('#stepFind').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); findGo(e.shiftKey?-1:1); } else if(e.key==='Escape'){ $('#stepFind').value=''; findPos=-1; runFind(); } });
+$('#stepFindNext').addEventListener('click',()=>findGo(1)); $('#stepFindPrev').addEventListener('click',()=>findGo(-1));
+$('#healthBtn').addEventListener('click',healthReport); $('#pathsBtn').addEventListener('click',openPaths); $('#catBtn').addEventListener('click',openCatalog); $('#catClose').addEventListener('click',()=>$('#dlgCat').close()); $('#pathClose').addEventListener('click',()=>$('#dlgPaths').close()); $('#hlClose').addEventListener('click',()=>$('#dlgHealth').close());
+async function cloneRoute(src,name,upto){ await rawLoad((src.guides||[]).map(g=>g.id)); const r=JSON.parse(JSON.stringify(src)); r.id=uid(); r.name=name; delete r.savedAt;
+  const map=new Map(); for(const g of r.guides||[]){ const nid=uid(); map.set(g.id,nid); if(rawCache.has(g.id)) rawPut(nid,rawCache.get(g.id)); g.id=nid; }
+  for(const s2 of r.steps||[]) if(s2.src&&map.has(s2.src.g)) s2.src.g=map.get(s2.src.g);
+  if(upto!=null) r.steps=r.steps.slice(0,upto+1); store.routes.push(r); return r; }
+$('#copyRoute').addEventListener('click',async()=>{ const name=await askText('Name for the copy:',route.name+' (copy)','Copy','text'); if(name==null) return;
+  const src=route; const r=await cloneRoute(src,name.trim()||src.name+' (copy)'); delete r.group; route=r; cursor=Math.min(cursor,r.steps.length-1); history=[]; FQ.key=null; refresh(); saveNow&&saveNow(); toast(`Copied to “${r.name}”. Edit this one freely: the original is unchanged.`,4000); });
+$('#newRoute').addEventListener('click',()=>{ const r=newRoute({char:{...route.char,level:1,xp:0,party:1}}); store.routes.push(r); route=r; cursor=-1; history=[]; refresh(); openChar(); });
+function grpRowHTML(fac,m){ m=m||{}; const races=Object.entries(RACES).filter(([n,[b,fa]])=>!fa||fa===fac).map(([n])=>n); return `<div class="row grprow" style="gap:6px;align-items:center"><input type="text" data-g="name" value="${esc(m.name||'')}" placeholder="Name" style="flex:1;min-width:0"><select data-g="race">${races.map(n=>`<option${n===m.race?' selected':''}>${n}</option>`).join('')}</select><select data-g="cls">${Object.keys(CLASSES).map(n=>`<option${n===m.cls?' selected':''}>${n}</option>`).join('')}</select><button type="button" class="btn sm" data-grpdel title="Remove">✕</button></div>`; }
+function grpRowsRead(){ return $$('#grpRows .grprow').map(d=>({name:d.querySelector('[data-g=name]').value.trim(),race:d.querySelector('[data-g=race]').value,cls:d.querySelector('[data-g=cls]').value})); }
+$('#grpAddRow').addEventListener('click',()=>{ const f=$('#charForm'); const n=$$('#grpRows .grprow').length; if(n>=4) return toast('A group is at most 5 characters.'); $('#grpRows').insertAdjacentHTML('beforeend',grpRowHTML(f.faction.value,{name:'Member '+(n+2),race:f.race.value,cls:f.cls.value})); });
+$('#grpRows').addEventListener('click',e=>{ if(e.target.closest('[data-grpdel]')) e.target.closest('.grprow').remove(); });
+$('#charForm').faction.addEventListener('change',e=>{ const ms=grpRowsRead(); $('#grpRows').innerHTML=ms.map(m=>grpRowHTML(e.target.value,m)).join(''); });
+$('#routeSel').addEventListener('change',e=>{ route=store.routes.find(r=>r.id===e.target.value); cursor=route.steps.length-1; history=[]; selQuest=null; refresh(); });
+
+/* ---------- export ---------- */
+function rxpZone(z){ return zoneName(z); }
+const STEP_DONE_RE=/^\s*(\+|\.(goto|accept|turnin|complete|collect|xp|hs|home|fly|fp|trainer|vendor|deathskip|zone|subzone|reputation|skill|abandon|money|itemcount|buy|cast|isQuestComplete|isOnQuest)\b)/i;
+function gotoLine(p){ if(!p||p.z==null) return null; const Z=META.zones[p.z]; if(Z&&Z.ui&&Z.b){ const [L,R,T,B]=Z.b; const a=L-(+p.px)/100*(L-R), b=T-(+p.py)/100*(T-B); return `    .goto ${Z.ui}/${Z.m},${a.toFixed(2)},${b.toFixed(2)}`; } return `    .goto ${rxpZone(p.z)},${(+p.px).toFixed(1)},${(+p.py).toFixed(1)}`; }
+function talkLines(p,tgt){ const ent=p?.ent||''; const name=tgt||(ent?entName(ent[0],+ent.slice(1)):null); if(!name) return {pre:[],post:[]}; if(!tgt&&ent[0]==='o') return {pre:[`    >>Click the |cRXP_PICK_${name}|r`],post:[]};
+  return {pre:[`    >>|Tinterface/worldmap/chatbubble_64grey.blp:20|tTalk to |cRXP_FRIENDLY_${name}|r`],post:[`    .target ${name}`]}; }
+function objLines(qid,obj){ const out=[], mobs=new Set(); if(!Q(qid)) return {pre:out,mobs:[]}; const uniq=a=>[...new Set(a)].slice(0,3);
+  for(const o of objectives(qid)){ if(o.pre||(obj&&o.rx!==obj)) continue; const names=uniq(o.pts.map(p=>p.label).filter(Boolean));
+    if(o.kind==='kill'){ if(names.length){ out.push(`    >>Kill |cRXP_ENEMY_${names.join('|r and |cRXP_ENEMY_')}|r`); names.forEach(n=>mobs.add(n)); } }
+    else if(o.kind==='loot'){ const src=uniq(o.pts.filter(p=>p.ent?.[0]==='n').map(p=>p.label)), ob=uniq(o.pts.filter(p=>p.ent?.[0]==='o').map(p=>p.label)); const it=o.text.replace(/ \(loot first\)$/,'');
+      if(src.length){ out.push(`    >>Kill |cRXP_ENEMY_${src.join('|r and |cRXP_ENEMY_')}|r. Loot them for |cRXP_LOOT_${it}|r`); src.forEach(n=>mobs.add(n)); } else if(ob.length) out.push(`    >>Loot the |cRXP_PICK_${ob.join('|r and |cRXP_PICK_')}|r for |cRXP_LOOT_${it}|r`); else out.push(`    >>Collect |cRXP_LOOT_${it}|r`); }
+    else if(o.kind==='obj'){ out.push(`    >>Click the |cRXP_PICK_${names[0]||o.text}|r`); }
+    else if(o.kind==='event') out.push(`    >>${o.text}`); }
+  return {pre:out,mobs:[...mobs].slice(0,4)}; }
+function objIndexList(qid){ const q=Q(qid); if(!q) return []; const o=q.o||{}; const out=[]; let i=1; const add=(txt)=>out.push([i++,txt]);
+  (o.c||[]).forEach(([id,t])=>add(t||entName('n',id))); (o.o||[]).forEach(([id,t])=>add(t||entName('o',id))); (o.i||[]).forEach(([id,t])=>add(t||DB.i[id]?.n||'item')); (o.k||[]).forEach(k=>add(k[2]||entName('n',k[1]||k[0][0]))); if(q.te) add(q.te[0]); return out; }
+let EXPORT_WARN=[], EXPORT_ADDED=[];
+const blkLines=t=>t.split('\n');
+const blkHdrCond=t=>(blkLines(t)[0].replace(/\s--.*$/,'').match(/<<\s*(.+)$/)||[])[1]||'';
+function blkRefs(t){ const out=[]; for(const l of blkLines(t)){ const m=l.replace(/\s--.*$/,'').match(/^\s*#(completewith|requires)\s+([^\s<]+)\s*(?:<<\s*(.+))?$/i); if(m&&condOK(m[3]||'')) out.push({k:m[1].toLowerCase(),v:m[2]}); } return out; }
+function blkLabels(t){ const out=[]; for(const l of blkLines(t)){ const m=l.replace(/\s--.*$/,'').match(/^\s*#label\s+([^\s<]+)\s*(?:<<\s*(.+))?$/i); if(m&&condOK(m[2]||'')) out.push(m[1]); } return out; }
+// would RestedXP drop or auto-skip this stock block for this character on Forever (so its absence changes nothing)?
+function blkAutoSkip(t){ if(!condOK(blkHdrCond(t))) return 'class'; const ls=blkLines(t).map(l=>l.replace(/\s--.*$/,'').trim());
+  if(ls.some(l=>/^#(hardcore|ssf|sod|som|hardcoreserver)\b/i.test(l))) return 'mode'; if(ls.some(l=>{ const m=l.match(/^#season\s+(.+)$/i); return m&&!/\b0\b/.test(m[1]); })) return 'mode';
+  const xr=ls.find(l=>/^#xprate\b/i.test(l)); if(xr&&!xrOK(xr.replace(/^#xprate\s*/i,'').split('<<')[0])) return 'xprate';
+  const dg=ls.filter(l=>/^\.dungeon\b/i.test(l)); if(dg.length&&!dungeonOK({dg:dg.filter(l=>!/!/.test(l)).map(l=>dgTag(l.split(/\s+/)[1])),dgs:dg.filter(l=>/!/.test(l)).map(l=>dgTag(l.replace(/.*!/,'').trim()))}).ok) return 'dungeon';
+  return ''; }
+let LAST_SEGS=null;
+function buildRXP(){
+  const g=route.guide; const fac=charInfo(route).fac==='H'?'Horde':'Alliance';
+  const name=$('#expName').value||route.name, group=$('#expGroup').value||'Forever Routes', next=$('#expNext').value, extra=$('#expExtra').value, merge=$('#expMerge').checked;
+  g.group=group; g.next=next; g.extra=extra; save();
+  EXPORT_ADDED=[]; const warns=[]; const segs=[]; let seg=null; const done=new Set();
+  const pendFin=[]; const flushFin=q=>{ if(!seg) return; for(let k=0;k<pendFin.length;k++){ const f=pendFin[k]; if(q!=null&&f.q!==q) continue; seg.items.push({rx:null,step:null,text:f.text,fin:true}); seg.prevKey=null; pendFin.splice(k--,1); } };
+  let CK=null; const newSeg=gid=>{ flushFin(null); seg={gid,cut:CK,items:[],lastBlk:null,prevKey:null,text(){ return this.items.map(x=>x.text).filter(Boolean); }}; segs.push(seg); };
+  const cutOf=s=>s.sec&&route.sections?.[s.sec]?.cut?s.sec:null; const ACR=accRuns();
+  const blockSteps=(g,rx)=>g.steps.filter(x=>x.rx===rx);
+  const actKey=(t,q)=>t+':'+q;
+  route.steps.forEach((s,i)=>{
+    const gg=s.src&&!s.src.auto?G(s.src.g):null; const gsx=gg?.steps[s.src.i]; const raw=gg&&rawCache.get(gg.id);
+    CK=cutOf(s); if(seg&&seg.cut!==CK) newSeg(gg?gg.id:null); /* a cut section (or the steps after one) starts a new guide */
+    if(gg){ if(!seg) newSeg(gg.id); else if(seg.gid!==gg.id){ if(seg.gid==null) seg.gid=gg.id; else newSeg(gg.id); } } else if(!seg) newSeg(null);
+    const L=[];
+    if(raw&&gsx&&gsx.rx&&raw[gsx.rx-1]!=null){
+      if(done.has(i)) return;
+      let j=i; const run=[]; while(j<route.steps.length){ const t=route.steps[j]; const tg=t.src&&!t.src.auto?G(t.src.g):null; const tx=tg?.steps[t.src.i]; if(!tx||tg.id!==gg.id||tx.rx!==gsx.rx) break; run.push(t); done.add(j); j++; }
+      if(seg.lastBlk&&seg.lastBlk.g===gg.id) for(let k=seg.lastBlk.rx+1;k<gsx.rx;k++){ const t=raw[k-1]; if(!t) continue; if(blkLines(t).slice(1).every(l=>/^\s*(#|--)/.test(l)) && condOK(blkHdrCond(t))) seg.items.push({rx:k,text:t,step:null}); } // label-only anchors
+      const runActs=new Set(run.filter(x=>x.q).map(x=>actKey(x.t,x.q))); const rm=new Set(gg.removed||[]); const blkActs=new Set(gg.steps.map((x,k)=>[x,k]).filter(([x,k])=>x.rx===gsx.rx&&x.cond&&x.q&&rm.has(k)).map(([x])=>actKey(x.t,x.q)));
+      const out=[]; let cut=0; for(const ln of raw[gsx.rx-1].split('\n')){ const am=ln.match(/^\s*\.(accept|turnin|complete)\s+(\d+)/i); if(am){ const k=actKey(am[1].toLowerCase(),+am[2]); if(blkActs.has(k)&&!runActs.has(k)){ cut++; continue; } } out.push(ln); }
+      for(let k=out.length-1;k>=0;k--){ const am=out[k].match(/^\s*\.accept\s+(\d+)/i); if(am&&ESCORT.has(+am[1])&&!out.some(l=>l.includes('Forever bug'))) out.splice(k+1,0,`    >>|cRXP_WARN_${ESC_NOTE}|r`); }
+      if(run.some(x=>x.opt)&&!out.some(l=>/^\s*#optional\b/i.test(l))) out.splice(1,0,'    #optional');
+      const pn=run.find(x=>x.pin&&pinnable(x)&&!(x.path&&x.path.length>=2)); if(pn){ const gl=gotoLine(pn.pin); const k=out.findIndex((l,k)=>k>0&&/^\s*\.goto\b/i.test(l)); if(k>0){ const m=out[k].match(/^\s*\.goto\s+[^,]+,\s*[\d.]+\s*,\s*[\d.]+(.*)$/i); out[k]=gl+(m?m[1]:''); } else { let h=1; while(h<out.length&&/^\s*#/.test(out[h])) h++; out.splice(h,0,gl); } }
+      const ep=run.find(x=>x.path!==undefined); if(ep){ for(let k=out.length-1;k>0;k--) if(/^\s*(#loop\b|\.goto\b)/i.test(out[k])) out.splice(k,1); if(ep.path&&ep.path.length>=2){ let h=1; while(h<out.length&&/^\s*#/.test(out[h])) h++; out.splice(h,0,'    #loop',gotoLine(ep.path[0])+',0',...ep.path.map(w=>gotoLine(w)+',30,0')); } }
+      const un=run.map(x=>x.unote).filter(Boolean); if(un.length){ let e=out.length; while(e>1&&!out[e-1].trim()) e--; out.splice(e,0,...un.flatMap(n=>n.split('\n')).filter(l=>l.trim()).map(l=>'    >>'+l.trim())); }
+      for(const m of out.join('\n').matchAll(/^\s*\.turnin\s+(\d+)/gm)) flushFin(+m[1]);
+      const txt=out.join('\n'); seg.items.push({rx:gsx.rx,text:txt,step:i,cut}); seg.lastBlk={g:gg.id,rx:gsx.rx}; seg.prevKey=null; return;
+    }
+    const r=SIM.res[i]; if(GRP.mem.has(i)&&!r.inactive) return; if(ACR.mem.has(i)) return; /* picked up in its group's first step */ /* done together with its group's first step */ const p=r.pt; const q=s.q?(Q(s.q)||{n:s.qn||('Quest '+s.q)}):null; const lines=[];
+    const gs=s.src?G(s.src.g)?.steps[s.src.i]:null; const dgl=gs?[...(gs.dg||[]).map(t=>'    .dungeon '+t),...(gs.dgs||[]).map(t=>'    .dungeon !'+t)]:[]; const xrl=gs&&gs.xr?'    #xprate '+gs.xr:null; const optl=(s.opt||s.gopt)?'    #optional':null;
+    if(s.t==='turnin'&&pendFin.some(f=>f.q===s.q)){ flushFin(s.q); }
+    const stl=s.stk==='next'?'    #completewith next':s.stk==='sticky'?'    #sticky':null;
+    const key=(s.t==='accept'||s.t==='turnin')&&p&&!stl&&!s.shared&&!isItemStart(s.q)?p.ent+'@'+p.X.toFixed(0)+'|'+dgl.join()+(xrl||'')+(optl||''):null;
+    const cont=merge&&key&&key===seg.prevKey; seg.prevKey=key;
+    const gp=s.t==='travel'&&(s.kind==='fly'||s.kind==='ride')?r.dep:p;
+    const gL=GRP.lead.get(i); const own=stl?null:(gL&&!gL.own&&gL.path?gL.path:(s.path||null)); if(!cont){ L.push('step'); if(stl) L.push(stl); if(optl) L.push(optl); if(xrl) L.push(xrl); if(own&&own.length>=2){ if(s.loopRaw) L.push(...s.loopRaw); else { L.push('    #loop'); L.push(gotoLine(own[0])+',0'); for(const w of own) L.push(gotoLine(w)+',30,0'); } } const gl=stl||(own&&own.length>=2)?null:gotoLine(gp); /* sticky / completewith steps get no arrow point, like the stock guides */ if(gl&&s.t!=='deathskip'&&!(s.t==='travel'&&(s.kind==='hs'||s.kind==='note'||s.kind==='ride'))&&(s.t!=='grind'||s.loc)) L.push(gl); }
+    if(s.t==='accept'&&s.shared){ lines.push(`    >>|cRXP_WARN_Have a party member share|r |cRXP_FRIENDLY_[${q.on||q.n}]|r |cRXP_WARN_with you|r`); lines.push(`    .accept ${s.q} >>Accept ${q.on||q.n}`); if(ESCORT.has(s.q)) lines.push(`    >>|cRXP_WARN_${ESC_NOTE}|r`); }
+    else if(s.t==='accept'&&isItemStart(s.q)){ for(const iid of Q(s.q).s.i){ const it=DB.i[iid]; const nm=it?.n||('item '+iid); const mobs=[...new Set((it?.d||[]).map(n=>entName('n',n)))], ob=[...new Set((it?.od||[]).map(n=>entName('o',n)))];
+        lines.push(mobs.length?`    >>Kill |cRXP_ENEMY_${mobs.slice(0,3).join('|r and |cRXP_ENEMY_')}|r. Loot ${mobs.length>1?'them':'it'} for |T134939:0|t[|cRXP_LOOT_${nm}|r]. |cRXP_WARN_Use it to start the quest|r`:`    >>Loot |T134939:0|t[|cRXP_LOOT_${nm}|r]${ob.length?' from the |cRXP_PICK_'+ob.join(', ')+'|r':''}. |cRXP_WARN_Use it to start the quest|r`);
+        lines.push(`    .collect ${iid},1,${s.q} --${nm} (1)`); }
+      lines.push(`    .accept ${s.q} >>Accept ${q.on||q.n}`); for(const iid of Q(s.q).s.i) lines.push(`    .use ${iid}`);
+      for(const m of [...new Set(Q(s.q).s.i.flatMap(i=>(DB.i[i]?.d||[]).map(n=>entName('n',n))))].slice(0,3)) lines.push(`    .mob ${m}`); if(ESCORT.has(s.q)) lines.push(`    >>|cRXP_WARN_${ESC_NOTE}|r`); }
+    else if(s.t==='accept'&&ACR.lead.has(i)){ const all=[i,...ACR.lead.get(i)]; const who=[]; const nmOf=k=>{ const st=route.steps[k], pt=SIM.res[k].pt; const e=pt?.ent||''; return st.tgt||(e?entName(e[0],+e.slice(1)):null); };
+      for(const k of all){ const n=nmOf(k); if(n&&!who.includes(n)) who.push(n); }
+      lines.push(`    >>|Tinterface/worldmap/chatbubble_64grey.blp:20|tTalk to ${who.map(n=>`|cRXP_FRIENDLY_${n}|r`).join(', ').replace(/, ([^,]*)$/,' and $1')} |cRXP_WARN_(split up: all are targeted)|r`);
+      for(const k of all){ const st=route.steps[k], qq=Q(st.q); lines.push(`    .accept ${st.q} >>Accept ${qq.on||qq.n}`); if(ESCORT.has(st.q)) lines.push(`    >>|cRXP_WARN_${ESC_NOTE}|r`); }
+      if(who.length) lines.push(`    .target ${who.join(',')}`); }
+    else if(s.t==='accept'||s.t==='turnin'){ const tk=cont?{pre:[],post:[]}:talkLines(p,s.tgt); lines.push(...tk.pre); lines.push(s.t==='accept'?`    .accept ${s.q} >>Accept ${q.on||q.n}`:`    .turnin ${s.q} >>Turn in ${q.on||q.n}`); lines.push(...tk.post); if(s.t==='accept'&&ESCORT.has(s.q)) lines.push(`    >>|cRXP_WARN_${ESC_NOTE}|r`); }
+    else if(s.t==='abandon') lines.push(`    .abandon ${s.q} >>Abandon ${q.on||q.n}`);
+    else if(s.t==='prof'){ if(s.act==='craft'){ lines.push(`    >>Craft ${s.n>1?s.n+' ':''}[${s.item}]`); if(s.itemId) lines.push(`    .collect ${s.itemId},${s.n||1} --${s.item} (${s.n||1})`); }
+      else { const nm=ptrainerOf(s.npc)?.name||s.npcName||'the trainer'; lines.push(`    >>|Tinterface/worldmap/chatbubble_64grey.blp:20|tTalk to |cRXP_FRIENDLY_${nm}|r`); if(s.act==='learn'&&PSPELL[s.prof]) lines.push(`    .train ${PSPELL[s.prof]} >> Train [${s.prof}]`); else lines.push(`    .trainer >> Train ${s.prof}`); lines.push(`    .target ${nm}`); } }
+    else if(s.t==='deathskip'){ const d=r.dep?withZone(r.dep):null; if(d&&d.z!=null&&!cont) L.push(`    #softcore`); if(d&&d.z!=null) lines.push(gotoLine(d)+',20,0 >>Die around here to respawn at the right graveyard'); lines.push('    .deathskip >> Die and respawn at the |cRXP_FRIENDLY_Spirit Healer|r'); lines.push('    .target Spirit Healer'); }
+    else if(s.t==='collect'){ const it=DB.i[s.item]; const nm=it?.n||('item '+s.item); const mobs=[...new Set((it?.d||[]).map(n=>entName('n',n)))], ob=[...new Set((it?.od||[]).map(n=>entName('o',n)))];
+      lines.push(mobs.length?`    >>Kill |cRXP_ENEMY_${mobs.join('|r and |cRXP_ENEMY_')}|r. Loot ${mobs.length>1?'them':'it'} for |cRXP_LOOT_${nm}|r`:`    >>Loot |cRXP_LOOT_${nm}|r${ob.length?' from the '+ob.join(', '):''}`);
+      lines.push(`    .collect ${s.item},${s.c||1}${s.q?','+s.q+',1':''} --${nm} (${s.c||1})`); for(const m of mobs.slice(0,3)) lines.push(`    .mob ${m}`); }
+    else if(s.t==='train'){ const nm=trainerOf(s.npc)?.name||s.npcName||'your class trainer'; lines.push(`    >>|Tinterface/worldmap/chatbubble_64grey.blp:20|tTalk to |cRXP_FRIENDLY_${nm}|r`); lines.push('    .trainer >> Train your class spells'); lines.push(`    .target ${nm}`); }
+    else if(s.t==='buy'){ const v=vendorOf(s.npc), nm=v?.name||s.npcName||'the vendor'; lines.push(`    >>|Tinterface/worldmap/chatbubble_64grey.blp:20|tTalk to |cRXP_FRIENDLY_${nm}|r`);
+      for(const it of s.items||[]) lines.push(`    >>|cRXP_BUY_Buy|r ${it.c>1?it.c+' ':''}[${it.n||itemName(it.id)}] |cRXP_BUY_from|r |cRXP_FRIENDLY_${nm}|r`);
+      for(const it of s.items||[]) if(it.id) lines.push(`    .collect ${it.id},${it.c} --Collect ${it.n||itemName(it.id)} (${it.c})`);
+      lines.push(`    .target ${nm}`); }
+    else if(s.t==='complete'&&s.cl?.length&&!Q(s.q)) lines.push(...s.cl);
+    else if(s.t==='complete'){ const cl=x=>{ const q=Q(x.q)||{n:x.qn||('Quest '+x.q)}; const out=[]; const ol=objLines(x.q,x.obj); if(Q(x.q)?.note&&!x.obj) out.push(`    >>|cRXP_WARN_${Q(x.q).note}|r`); out.push(...ol.pre); const obs=objIndexList(x.q).filter(([n])=>!x.obj||n===x.obj); if(obs.length) obs.forEach(([n,t])=>out.push(x.upto>0&&x.obj===n?`    .complete ${x.q},${n},${x.upto} --${t} (${x.upto})`:`    .complete ${x.q},${n} --${t}`)); else if(!ol.pre.length) out.push(`    >>Complete ${q.on||q.n}`); return {out,mobs:ol.mobs}; };
+      const gl=GRP.lead.get(i); const all=[s,...(gl?gl.mem.map(k=>route.steps[k]):[])]; const mobs=new Set(); for(const x of all){ const c=cl(x); lines.push(...c.out); c.mobs.forEach(m=>mobs.add(m)); if(x!==s&&x.unote) lines.push(...x.unote.split('\n').filter(l=>l.trim()).map(l=>'    >>'+l.trim())); }
+      [...mobs].forEach(m=>lines.push(`    .${all.some(x=>Q(x.q)?.xk?.some(id=>entName('n',id)===m))?'unitscan':'mob'} ${m}`)); }
+    else if(s.t==='grind'){ const a=r.after; if(s.mobs?.length) lines.push(`    >>Kill |cRXP_ENEMY_${s.mobs.join('|r and |cRXP_ENEMY_')}|r`); lines.push(`    .xp ${a.level}${a.xp?'+'+a.xp:''} >>Grind to ${a.level<MAXLVL&&a.xp?fmt(a.xp)+' XP into ':''}level ${a.level}${s.note?' ('+s.note+')':''}`); for(const m of s.mobs||[]) lines.push(`    .mob ${m}`); }
+    else if(s.t==='custom'){ const verb={turnin:'Turn in',accept:'Accept',complete:'Complete'}[s.act||'turnin']; if(s.qid&&s.act!=='complete') lines.push(`    .${s.act==='accept'?'accept':'turnin'} ${s.qid} >>${verb} ${s.name}`); else lines.push(`    >>${verb} ${s.name}${s.xp&&s.act==='turnin'?' (+'+s.xp+' XP)':''}`); }
+    else if(s.t==='party') lines.push(s.size>1?`    >>Group up with ${s.size-1} other player${s.size>2?'s':''}`:'    >>Continue solo');
+    else if(s.t==='travel'&&s.kind==='fly'&&r.dest){ const t=taxiShort(r.dest); lines.push(`    .fly ${t} >>Fly to ${t}`); if(r.dep?.label&&r.dep.node) lines.push(`    .target ${r.dep.label}`); }
+    else if(s.t==='travel'&&s.kind==='fp'&&r.node){ const t=taxiShort(r.node); lines.push(`    .fp ${t} >>Get the ${t} flight path`); if(r.pt?.label&&r.pt.node) lines.push(`    .target ${r.pt.label}`); }
+    else if(s.t==='travel'&&s.kind==='ride'&&r.ride){ const rd=r.ride, z=rxpZone(rd.zone); if(!cont&&r.dep) lines.push(gotoLine(r.dep)+',40'+(rd.kind==='Zeppelin'?' >>Go up the Zeppelin Tower':'')); lines.push(`    .zone ${z} >>${rd.text}`); lines.push(`    .zoneskip ${z}`); }
+    else if(s.t==='travel'&&s.kind==='hs'){ lines.push(`    .hs >>Hearth to ${r.pt?.label||rxpPlain(s.text||'')}`); lines.push('    .use 6948'); }
+    else if(s.t==='travel'){ const t=s.text||''; lines.push(({fly:`    .fly ${t} >>Fly to ${t}`,fp:`    .fp ${t} >>Get the ${t} flight path`,home:`    .home >>Set your Hearthstone to ${t}`,hs:`    .hs >>Hearth to ${t}`,goto:`    >>Go to ${t}`,note:`    >>${t}`})[s.kind]); }
+    if(s.unote) lines.push(...s.unote.split('\n').filter(l=>l.trim()).map(l=>'    >>'+l.trim()));
+    if(!cont){ /* RestedXP auto-completes (skips) a step made only of text: give it a manual checkbox (+line) so notes always stay until ticked */
+      const st0=L.lastIndexOf('step'); const all=[...L.slice(st0+1),...lines];
+      if(!all.some(l=>STEP_DONE_RE.test(l))){ const k=lines.findIndex(l=>/^\s*>>/.test(l)); if(k>=0) lines[k]=lines[k].replace(/^(\s*)>>\s*/,'$1+'); else lines.push('    +'+(rxpPlain(stepText(s).t)||'Done')); } }
+    L.push(...lines); if(!cont) L.push(...dgl);
+    seg.items.push({rx:null,step:i,text:L.join('\n')});
+    if(stl&&s.t==='complete'&&s.q&&!r.inactive&&r.passive==null){ const P=pathOf(s); const F=['step'];
+      if(P&&P.length>=2){ if(s.loopRaw) F.push(...s.loopRaw); else { F.push('    #loop',gotoLine(P[0])+',0',...P.map(w=>gotoLine(w)+',30,0')); } } else { const g=gotoLine(p); if(g) F.push(g); }
+      if(F.length>1){ if(s.cl?.length&&!Q(s.q)) F.push(...s.cl); else { const ol=objLines(s.q,s.obj); F.push(...ol.pre); const obs=objIndexList(s.q).filter(([n])=>!s.obj||n===s.obj); obs.forEach(([n,t])=>F.push(`    .complete ${s.q},${n} --${t}`)); ol.mobs.forEach(m=>F.push(`    .mob ${m}`)); }
+        pendFin.push({q:s.q,text:F.join('\n')}); } }
+  });
+  flushFin(null);
+  if(!segs.length) newSeg(null);
+  // keep RestedXP's label links working: add stock blocks that exported steps point to (#completewith / #requires) if they were left out
+  for(const sg of segs){ if(!sg.gid) continue; const gg=G(sg.gid), raw=rawCache.get(sg.gid); if(!raw) continue;
+    const have=()=>new Set(sg.items.filter(x=>x.text).flatMap(x=>blkLabels(x.text)));
+    for(const it of [...sg.items]) if(it.text) for(const ref of blkRefs(it.text)){ if(ref.v==='next'||have().has(ref.v)) continue;
+      let k=-1; raw.forEach((t,ix)=>{ if(t&&condOK(blkHdrCond(t))&&blkLabels(t).includes(ref.v)) k=ix+1; });
+      if(k<0) continue; // the stock guide has the same dangling reference for this character
+      const t=raw[k-1]; const pos=sg.items.findIndex(x=>x.rx!=null&&x.rx>k); const acts=/^\s*\.(accept|turnin|complete|collect|fly|fp|hs|home|train|trainer|vendor|deathskip|use)\b/m.test(t);
+      if(!acts){ const ins={rx:k,text:t,step:null,added:true}; EXPORT_ADDED.push({guide:gg.name,label:ref.v,text:t}); if(pos<0) sg.items.push(ins); else sg.items.splice(pos,0,ins); continue; }
+      // the labelled stock step does things you didn't put in your route: move just its #label onto your next step instead of pulling that step in
+      const nx=pos>=0?sg.items[pos]:null;
+      if(nx&&nx.text&&!blkLabels(nx.text).length){ const L2=nx.text.split('\n'); L2.splice(1,0,'    #label '+ref.v); nx.text=L2.join('\n'); EXPORT_ADDED.push({guide:gg.name,label:ref.v,text:'(label moved onto your next step)'}); }
+      else { const stub=`step\n    #label ${ref.v}\n    >>|cRXP_WARN_Continue with the next step|r`; EXPORT_ADDED.push({guide:gg.name,label:ref.v,text:stub}); if(pos<0) sg.items.push({rx:k,text:stub,step:null,added:true}); else sg.items.splice(pos,0,{rx:k,text:stub,step:null,added:true}); } }
+  }
+  // checks against the stock guide
+  segs.forEach((sg,si)=>{ if(!sg.gid) return; const gg=G(sg.gid), raw=rawCache.get(sg.gid); if(!raw) return;
+    const blocks=sg.items; const labelCount=new Map(); blocks.filter(x=>x.text).forEach(x=>blkLabels(x.text).forEach(l=>labelCount.set(l,(labelCount.get(l)||0)+1)));
+    for(const [l,n] of labelCount) if(n>1&&raw.filter(t=>t&&condOK(blkHdrCond(t))&&blkLabels(t).includes(l)).length<n) warns.push(`${gg.name}: “#label ${l}” appears ${n} times because a guide step was split up in your route; RestedXP uses the last one.`);
+    blocks.forEach((x,bi)=>{ if(!x.text||!blkRefs(x.text).some(r=>r.v==='next')) return; const nx=blocks[bi+1];
+      let want=-1; for(let k=x.rx+1;k<=raw.length;k++){ const t=raw[k-1]; if(t&&condOK(blkHdrCond(t))){ want=k; break; } }
+      if(want<0) return; const ok=nx&&nx.rx!=null&&(nx.rx===want||(()=>{ for(let k=want;k<nx.rx;k++){ const t=raw[k-1]; if(t&&condOK(blkHdrCond(t))&&!blkAutoSkip(t)) return false; } return nx.rx>want; })());
+      if(!ok){ const sn=x.step!=null?x.step+1:'?'; warns.push(`Step ${sn} (${gg.name}) uses “#completewith next”, so RestedXP shows it together with the step after it. In your route that is ${nx?(nx.rx==null?'your own step '+(nx.step+1):'a different guide step'):'nothing'} instead of the guide’s next step, so it may stay on screen longer or shorter than in the original.`); } });
+    blocks.forEach(x=>{ if(x.cut) warns.push(`Step ${x.step+1} (${gg.name}): ${x.cut} quest line${x.cut>1?'s were':' was'} left out because you removed ${x.cut>1?'those steps':'that step'} from your route.`); });
+  });
+  for(const gid of new Set(route.steps.filter(x=>x.src&&!x.src.auto).map(x=>x.src.g))){ const gg=G(gid); if(!gg) continue; const miss=fillGuide(gg,true); if(miss.length){ const fq=miss.filter(i=>gg.steps[i].q&&!Q(gg.steps[i].q)).length; warns.unshift(`${miss.length} step${miss.length>1?'s':''} of ${gg.name}${fq?` (including ${fq} for Forever quests)`:''} ${miss.length>1?'are':'is'} missing from your route, so ${miss.length>1?'they are':'it is'} not in this export. Open the guide in the Guides tab and click “Fill in missing steps in place”.`); } }
+  const ag=route.steps.map((x,k)=>x.src&&x.src.auto?k+1:0).filter(Boolean); if(ag.length) warns.push(`${ag.length} catch-up grind step${ag.length>1?'s were':' was'} added by the planner and ${ag.length>1?'are':'is'} not in the original guides (step${ag.length>1?'s':''} ${ag.slice(0,12).join(', ')}${ag.length>12?'…':''}). Delete ${ag.length>1?'them':'it'} if you want the guide exactly as written.`);
+  EXPORT_WARN=warns;
+  const cutPart=k=>{ const c=segs[k].cut; const all=segs.map((x,j)=>j).filter(j=>segs[j].cut===c); const sib=all.filter(j=>Math.abs(j-k)<=all.length); return all.length>1?` (${all.indexOf(k)+1}/${all.length})`:''; };
+  const nm=k=>segs.length===1&&!segs[0].cut?name:`${name} ${k+1}${segs[k].cut?' - '+route.sections[segs[k].cut].name+cutPart(k):segs[k].gid?' - '+G(segs[k].gid).name:''}`;
+  LAST_SEGS=segs.map((sg,k)=>({key:nm(k).slice(name.length).replace(/^ \d+( - )?/,''),blocks:sg.text().flatMap(t=>t.split(/\n(?=step\b)/))}));
+  const outL=[]; if(segs.some(sg=>sg.items.some(x=>x.rx!=null))) outL.push('-- Contains text from RestedXP guides (https://github.com/RestedXP/RXPGuides), licensed CC BY-NC-SA 4.0.','-- If you share this file: credit RestedXP, keep it non-commercial and share it under the same licence.','-- Made with the Forever Route Planner (GPL-3.0). Not affiliated with RestedXP, Blizzard or WoW: Forever.','');
+  segs.forEach((sg,k)=>{ const H=[`RXPGuides.RegisterGuide(${JSON.stringify(group)},[[`]; const ex=extra?extra.split(/\s*;\s*|\n/).filter(Boolean):[]; if(!ex.some(l=>/^#forever\b/i.test(l))) H.push('#forever'); H.push(...ex); H.push(`<< ${fac}`); H.push(`#name ${nm(k)}`); const nx=k<segs.length-1?nm(k+1):next; if(nx) H.push(`#next ${nx}`);
+    outL.push(...H, ...sg.text(), ']])'); if(k<segs.length-1) outL.push(''); });
+  return outL.join('\n');
+}
+async function exportText(){ const m=$('#expMode [aria-pressed="true"]').dataset.m; const ids=route.steps.filter(s=>s.src&&!s.src.auto).map(s=>s.src.g); await rawLoad(ids);
+  if(m==='rxp'){ $('#expText').value=buildRXP(); const miss=[...new Set(ids)].filter(id=>!rawCache.has(id)).map(id=>G(id)?.name).filter(Boolean); const msgs=[]; if(miss.length) msgs.push(`Re-import ${miss.join(', ')} to export ${miss.length>1?'their':'its'} steps exactly as written in the guide.`); msgs.push(...EXPORT_WARN); $('#expMsg').innerHTML=msgs.map(m=>`<div>⚠ ${esc(m)}</div>`).join(''); }
+  else { const used=new Set(ids); const r=JSON.parse(JSON.stringify(route)); for(const g of r.guides||[]) if(used.has(g.id)&&rawCache.has(g.id)) g.raw=rawCache.get(g.id); $('#expText').value=JSON.stringify({format:'forever-route-planner/1',route:r},null,1); $('#expMsg').textContent=''; } }
+$('#exportBtn').addEventListener('click',()=>{ $('#expGroup').value=route.guide?.group||'Forever Routes'; $('#expName').value=route.name; $('#expNext').value=route.guide?.next||''; $('#expExtra').value=route.guide?.extra||''; setSeg('#expMode','rxp'); exportText(); $('#dlgExport').showModal(); });
+$('#expMode').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b) return; setSeg('#expMode',b.dataset.m); exportText(); });
+['#expGroup','#expName','#expNext','#expExtra','#expMerge'].forEach(s=>$(s).addEventListener('input',exportText));
+$('#expClose').addEventListener('click',()=>$('#dlgExport').close());
+$('#expCopy').addEventListener('click',async()=>{ try{ await navigator.clipboard.writeText($('#expText').value); toast('Copied'); }catch(e){ $('#expText').select(); document.execCommand('copy'); toast('Copied'); } });
+$('#expSave').addEventListener('click',async()=>{ const m=$('#expMode [aria-pressed="true"]').dataset.m; const name=((m==='rxp'?$('#expName').value.trim():'')||route.name||'route').replace(/[\\/:*?"<>|]+/g,'_').trim();
+  const dl=window.claude&&await window.claude.use('downloads').catch(()=>null);
+  if(!dl){ try{ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([$('#expText').value],{type:'text/plain'})); a.download=m==='rxp'?name+'.lua':name+'.json'; document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); },1000); toast('Saved'); }catch(e){ toast('Download isn\u2019t available here. Use Copy instead.'); } return; }
+  try{ await dl.save({filename:m==='rxp'?name+'.txt':name+'.json',data:new TextEncoder().encode($('#expText').value)}); toast('Saved'); }
+  catch(e){ if(e?.code!=='declined') toast('Download failed: '+(e?.message||e?.code||'unknown')); } });
+$('#expFile').addEventListener('change',async e=>{ const f=e.target.files[0]; if(!f) return; $('#expText').value=await f.text(); e.target.value=''; $('#expImport').click(); });
+$('#expImport').addEventListener('click',()=>{ try{ const o=JSON.parse($('#expText').value); const r=o.route||o; if(!Array.isArray(r.steps)) throw 0; const nr=migrateRoute(newRoute({...r,id:uid(),name:(r.name||'Imported')+' (imported)'})); for(const g of nr.guides||[]) if(g.raw){ rawPut(g.id,g.raw); delete g.raw; } store.routes.push(nr); route=nr; cursor=nr.steps.length-1; history=[]; refresh(); $('#dlgExport').close(); toast('Route imported'); }catch(e){ toast('That text isn\u2019t a route file'); } });
+
+/* ---------- zone images (IndexedDB, this browser only) ---------- */
+const IDB={db:null,
+  open(){ return new Promise(res=>{ try{ const rq=indexedDB.open('frp-images',1); rq.onupgradeneeded=()=>rq.result.createObjectStore('img'); rq.onsuccess=()=>{this.db=rq.result;res(this.db)}; rq.onerror=()=>res(null); }catch(e){res(null)} }); },
+  tx(mode){ return this.db.transaction('img',mode).objectStore('img'); },
+  put(k,v){ return new Promise(r=>{ if(!this.db) return r(); const q=this.tx('readwrite').put(v,k); q.onsuccess=q.onerror=()=>r(); }); },
+  del(k){ return new Promise(r=>{ if(!this.db) return r(); const q=this.tx('readwrite').delete(k); q.onsuccess=q.onerror=()=>r(); }); },
+  all(){ return new Promise(r=>{ if(!this.db) return r([]); const out=[]; const q=this.tx('readonly').openCursor(); q.onsuccess=()=>{ const c=q.result; if(c){ out.push([c.key,c.value]); c.continue(); } else r(out); }; q.onerror=()=>r(out); }); }
+};
+async function loadImages(){ await IDB.open(); for(const [k,blob] of await IDB.all()){ try{ zoneImgs.set(+k,await createImageBitmap(blob)); }catch(e){} } try{ imgOpacity=+(localStorage.getItem('frp.imgop')||0.95); }catch(e){} requestDraw(); }
+function renderImgList(){ $('#imgList').innerHTML=zoneImgs.size?[...zoneImgs.keys()].map(z=>`${esc(zoneName(z))} <button class="linkish" data-rmimg="${z}">Remove</button>`).join(' · '):'No zone images added yet.'; }
+$('#imgBtn').addEventListener('click',()=>{ $('#imgZone').innerHTML=Object.entries(META.zones).sort((a,b)=>a[1].n.localeCompare(b[1].n)).map(([z,Z])=>`<option value="${z}">${esc(Z.n)}${zoneImgs.has(+z)?' (added)':''}</option>`).join(''); $('#imgOpacity').value=imgOpacity; renderImgList(); $('#dlgImg').showModal(); });
+$('#imgFile').addEventListener('change',async e=>{ const file=e.target.files[0]; if(!file) return; const z=+$('#imgZone').value; try{ const bmp=await createImageBitmap(file); zoneImgs.set(z,bmp); await IDB.put(String(z),file); renderImgList(); requestDraw(); toast(zoneName(z)+' image added'); }catch(err){ toast('That file couldn\u2019t be read as an image'); } e.target.value=''; });
+$('#imgList').addEventListener('click',async e=>{ const b=e.target.closest('[data-rmimg]'); if(!b) return; zoneImgs.delete(+b.dataset.rmimg); await IDB.del(b.dataset.rmimg); renderImgList(); requestDraw(); });
+$('#imgOpacity').addEventListener('input',e=>{ imgOpacity=+e.target.value; try{localStorage.setItem('frp.imgop',imgOpacity)}catch(_){ } requestDraw(); });
+$('#imgClose').addEventListener('click',()=>$('#dlgImg').close());
+
+/* ---------- misc ---------- */
+function toast(t,ms){ const el=$('#toast'); el.textContent=t; el.style.display='block'; clearTimeout(toast._t); toast._t=setTimeout(()=>el.style.display='none',ms||2200); }
+$$('#layers input').forEach(i=>i.addEventListener('change',()=>{ layers[i.dataset.l]=i.checked; requestDraw(); }));
+$('#zin').addEventListener('click',()=>zoomAt(1.5,W/2,H/2)); $('#zout').addEventListener('click',()=>zoomAt(1/1.5,W/2,H/2)); $('#zfit').addEventListener('click',fitAll);
+$('#zcur').addEventListener('click',()=>{ let p=null; for(let i=cursor;i>=0&&!p;i--) p=SIM.res[i]?.pt; if(p) flyTo(p.X,p.Y,Math.max(view.s,0.12)); else toast('No step with a location yet'); });
+$('#zoneJump').addEventListener('change',e=>{ if(e.target.value) flyToZone(+e.target.value); e.target.value=''; });
+function applyTheme(t){ if(t) document.documentElement.setAttribute('data-theme',t); else document.documentElement.removeAttribute('data-theme'); }
+$('#themeBtn').addEventListener('click',()=>{ const cur=document.documentElement.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'); const nt=cur==='light'?'dark':'light'; applyTheme(nt); try{localStorage.setItem('frp.theme',nt)}catch(e){} });
+function openPanel(which){ if(innerWidth>900) return; closePanels(); $(which==='left'?'#leftPanel':'#rightPanel').classList.add('open'); }
+function closePanels(){ $$('.panel').forEach(p=>p.classList.remove('open')); }
+$('#openLeft').addEventListener('click',()=>{ const o=$('#leftPanel').classList.contains('open'); closePanels(); if(!o) openPanel('left'); });
+$('#openRight').addEventListener('click',()=>{ const o=$('#rightPanel').classList.contains('open'); closePanels(); if(!o) openPanel('right'); });
+canvas.addEventListener('pointerdown',()=>{ if(innerWidth<=900) closePanels(); });
+
+(async function init(){
+  try{ const t=localStorage.getItem('frp.theme'); if(t) applyTheme(t); }catch(e){}
+  await loadData();
+  buildPaths(); makePatterns(); loadRelief(); navInit();
+  $('#zoneJump').innerHTML='<option value="">Jump to zone…</option>'+Object.entries(META.zones).sort((a,b)=>a[1].n.localeCompare(b[1].n)).map(([z,Z])=>`<option value="${z}">${esc(Z.n)}${Z.lv?' ('+Z.lv+')':''}</option>`).join('');
+  await loadStore(); await loadCatalog(); new ResizeObserver(resize).observe(canvas); resize();
+  rawLoad(store.routes.flatMap(r=>(r.guides||[]).map(g=>g.id))).then(()=>{ if(tab==='guides') renderRight(); });
+  refresh();
+  const first=SIM.res.find(r=>r.pt)?.pt;
+  if(first) flyTo(first.X,first.Y,0.12); else { const n=SIM.near?.pt; if(n) flyTo(n.X,n.Y,0.1); else fitAll(); }
+  if(innerWidth<=900) $('#layers').open=false;
+  $('#loading').remove();
+  document.fonts?.ready.then(requestDraw);
+  loadImages();
+})().catch(e=>{ $('#loading').textContent='The quest data failed to load: '+e.message; console.error(e); });
+
+/* ---------- deleting steps and routes ---------- */
+$('#clearSteps').addEventListener('click',async()=>{ if(!route.steps.length) return toast('This route has no steps'); if(!await ask(`Remove all ${route.steps.length} steps from "${route.name}"? You can undo this.`)) return; pushHistory(); route.steps=[]; cursor=-1; $('#dlgChar').close('cancel'); refresh(); toast('All steps removed. Undo brings them back.'); });
+$('#clearAfter').addEventListener('click',async()=>{ const n=route.steps.length-1-cursor; if(n<=0) return toast('No steps after the selected one'); if(!await ask(`Remove the ${n} step${n>1?'s':''} after step ${cursor+1}? You can undo this.`)) return; pushHistory(); route.steps.splice(cursor+1); $('#dlgChar').close('cancel'); refresh(); toast(`Removed ${n} step${n>1?'s':''}`); });
+$('#delRoute').addEventListener('click',async()=>{ if(!await ask(`Delete the route "${route.name}" and its imported guides? This can't be undone.`)) return;
+  store.deleted=[...(store.deleted||[]),route.id]; kvDel('route:'+route.id); store.routes=store.routes.filter(r=>r!==route); if(!store.routes.length) store.routes.push(newRoute({name:'New route'}));
+  route=store.routes[0]; cursor=route.steps.length-1; history=[]; selQuest=null; if(typeof selGuide!=='undefined') selGuide=null; $('#dlgChar').close('cancel'); refresh(); toast('Route deleted'); });
+let stepsFocus=false; document.addEventListener('pointerdown',e=>{ stepsFocus=!!e.target.closest('#steps'); },true);
+document.addEventListener('keydown',e=>{ if((e.key==='Delete'||e.key==='Backspace')&&stepsFocus&&cursor>=0&&!e.target.closest('input,textarea,select,dialog')){ e.preventDefault(); removeStep(cursor); } });
+
+$('#groupSel').addEventListener('change',e=>{ const v=+e.target.value; if(v===(SIM.st.party||1)) return; addStep({t:'party',size:v}); toast(v>1?`Group of ${v} from step ${cursor+1}`:`Solo from step ${cursor+1}`); });
+
+function whURL(qid,alt){ const q=Q(qid); return (qid>=90000||!q||q.fv||foreverQuests().has(+qid))?'https://www.wowhead.com/forever/quest='+qid:'https://www.wowhead.com/classic/quest='+qid; } /* Forever-only quests live on Wowhead's Forever branch */
+function whLink(qid,btn){ const url=whURL(qid);
+  return btn?`<a class="btn sm" href="${url}" target="_blank" rel="noopener" style="text-decoration:none">Wowhead ↗</a>`:`<a href="${url}" target="_blank" rel="noopener">Wowhead ↗</a>`; }
+
+function objChecklist(qid,v){ const obs=objectives(qid).filter(o=>o.rx); if(obs.length<2&&!(v&&v.objs&&v.objs.size)) return obs.length?'':'';
+  return `<span class="olist">${obs.map(o=>{ const done=v&&(v.done||(v.objs&&v.objs.has(o.rx))); return `<span class="oitem ${done?'done':''}">${done?'✓':'○'} ${esc(o.text)}${!done&&v?` <button class="linkish" data-cobj="${qid}:${o.rx}">done here</button>`:''}</span>`; }).join('')}</span>`; }
+
+/* ---------- RestedXP guide import & ghost routes ---------- */
+const GCOLORS=['#5fd9e8','#ff8fd6','#a6ff7a','#ffb35c','#b39dff'];
+let GH=new Map();            // guideId -> {res:[...], pts:[...]}
+let selGuide=null, selGhost=null, gFilter='relevant';
+layers.ghost=true;
+
+function zoneLookup(){
+  if(zoneLookup.m) return zoneLookup.m; const m=new Map();
+  for(const [z,Z] of Object.entries(META.zones)){ const n=Z.n.toLowerCase(); m.set(n,+z); m.set(n.replace(/^the /,''),+z); m.set(n.replace(/[^a-z]/g,''),+z); if(Z.ui) m.set(String(Z.ui),+z); }
+  m.set('barrens',17); m.set('stranglethorn',33); m.set('hillsbrad',267); m.set('stormwind',1519); m.set('ungoro crater',490); m.set('ungorocrater',490);
+  return zoneLookup.m=m;
+}
+function zoneFromName(n){ const m=zoneLookup(); n=String(n).trim().toLowerCase(); return m.get(n)??m.get(n.replace(/^the /,''))??m.get(n.replace(/[^a-z0-9]/g,'')); }
+// same rules as RestedXP's applies() (GuideLoader.lua) on the Forever client: '/' = or, space = and, '!' = not, (...) groups;
+// class names match any case, races/factions match exactly (Undead = Scourge), numbers = player level, anything else (skip, era, sod, typos) is false
+const RXP_RACE={'Undead':'Scourge','Night Elf':'NightElf'};
+function condOK(str){
+  if(!str) return true; str=String(str).trim(); if(!str) return true;
+  const ci=charInfo(route); const cls=String(route.char.cls||'').toUpperCase(); const race=RXP_RACE[route.char.race]||String(route.char.race||'').replace(/\s/g,''); const fac=ci.fac==='H'?'Horde':'Alliance'; const lvl=+route.char.level||1;
+  const parse=t=>{ t=t.replace(/(!?)\(\s*(.*?)\s*\)/g,(m,op,inner)=>parse(inner)!==(op==='!')?cls:'NULL');
+    for(const alt of t.split('/')){ let v=true; for(let e of alt.match(/!?[A-Za-z0-9]+/g)||[]){ let st=false; if(e[0]==='!'){ st=true; e=e.slice(1); } const lv=/^\d+$/.test(e)?+e:0xfff; if(e==='Undead') e='Scourge'; const up=e.toUpperCase();
+        const m=up===cls||e===race||e===fac||lvl>=lv||up==='FOREVER'; v=(!m)===st; if(!v) break; } if(v) return true; } return false; };
+  return parse(str);
+}
+function verTag(k,val){
+  const [v,c]=String(val||'').split('<<'); if(c&&!condOK(c)) return null;
+  if(k==='season'){ const s=v.split(/[,\s]+/).filter(Boolean).map(Number); return s.includes(0)?null:(s.includes(2)?'Season of Discovery only':'Season of Mastery only'); }
+  if(k==='som') return 'Season of Mastery only';
+  if(k==='sod') return 'Season of Discovery only';
+  if(k==='hardcore'||k==='hardcoreserver') return 'Hardcore only';
+  if(k==='ssf') return 'Self-found only';
+  return null; }
+function parseRXP(text){
+  const out=[]; const re=/RegisterGuide\s*\(([\s\S]*?)\[(=*)\[([\s\S]*?)\]\2\]/g; let m;
+  while((m=re.exec(text))) out.push(parseGuideBody(m[3],(m[1].match(/["']([^"']+)["']/)||[])[1]||''));
+  if(!out.length && /(^|\n)\s*step\b/.test(text)) out.push(parseGuideBody(text,''));
+  return out;
+}
+function parseGuideBody(body,group){
+  const g={name:'',group,cond:'',next:'',nexts:[],blocks:[]}; let cur=null;
+  for(const raw of body.split(/\r?\n/)){
+    if(cur && raw.trim() && !/^\s*step\b/i.test(raw)) cur.raw.push(raw.replace(/\s+$/,''));
+    const cm=raw.match(/^\s*\.complete\s+\d+\s*,\s*(\d+)[^-]*--.*?\(x?(\d+)\)/i);
+    let line=raw.replace(/\s--.*$/,'').replace(/^--.*$/,'').trim(); if(!line) continue; if(cm) line+=` @@${cm[1]}=${cm[2]}`;
+    const hdr=line.match(/^#(\w+)\s*(.*)$/);
+    if(hdr){ const k=hdr[1].toLowerCase(); if(cur&&k==='optional') cur.optional=true; if(cur&&(k==='completewith'||k==='label'||k==='requires')){ const [v,c]=hdr[2].split('<<'); if(condOK(c||'')) cur[k]=v.trim(); } if(cur&&k==='loop'){ const c=hdr[2].split('<<')[1]; if(condOK(c||'')) cur.loop=true; } if(cur&&k==='sticky'){ const c=hdr[2].split('<<')[1]; if(condOK(c||'')) cur.sticky=true; } if(k==='xprate'){ const [xr,xc]=hdr[2].split('<<'); if(cur){ if(condOK(xc||'')) cur.xprate=xr.trim(); } else g.xprate=xr.trim(); } { const vw=verTag(k,hdr[2]); if(vw){ if(cur) cur.ver=cur.ver||vw; else g.ver=g.ver||vw; } }
+      if(!cur){ if(k==='name') g.name=hdr[2].trim(); else if(k==='next'){ for(const alt of hdr[2].split(';')){ const [nx,nc]=alt.split('<<'); const nm=nx.replace(/^\s*#group\s+/i,'').split('\\').pop().trim(); if(nm&&condOK(nc||'')) g.nexts.push(nm); } g.next=g.nexts.join(';'); } else if(k==='group'&&!g.group){ for(const alt of hdr[2].split(';')){ const [gn,gc]=alt.split('<<'); if(condOK(gc||'')){ g.group=gn.trim(); break; } } } } continue; }
+    if(/^step\b/i.test(line)){ cur={cond:(line.match(/<<\s*(.+)$/)||[])[1]||'',lines:[],raw:[raw.replace(/\s+$/,'')]}; g.blocks.push(cur); continue; }
+    if(!cur){ if(line.startsWith('<<')) g.cond=line.slice(2).trim(); continue; }
+    cur.lines.push(line);
+  }
+  return g;
+}
+function convertLoc(z,px,py,convert){ const cv=META.zones[z]?.cv; if(convert&&cv){ px=px*cv[0]+cv[1]; py=py*cv[2]+cv[3]; } return {z,px:+px.toFixed(1),py:+py.toFixed(1)}; }
+function buildGuideSteps(g,convert){
+  const steps=[]; let unknownZones=new Set();
+  g.blocks.forEach((b,bi)=>{
+    const bOK=condOK(b.cond)&&!b.ver; let loc=null, firstLoc=null; const pend=[]; const notes=[]; const seenC=new Set(); const dg=[], dgs=[]; let lmin=0, lmax=0; const startN=steps.length; const disp=[]; const reqs=[]; let gotoTxt=''; const gl=[]; const tgts=[];
+    for(const line of b.lines){
+      const [main,econd]=line.split('<<'); const ok=bOK&&condOK(econd||''); const txt=(main.match(/>>\s*(.*)$/)||[])[1]||''; const cmd=main.replace(/>>.*$/,'').trim();
+      if(txt&&ok&&!/^\.(accept|turnin|complete|goto|xp)\b/i.test(cmd)) disp.push(txt.trim());
+      if(/^\+/.test(main.trim())){ if(ok) disp.push(main.trim().slice(1).trim()); continue; }
+      let m;
+      if((m=cmd.match(/^\.xp\s*([<>]?)\s*(\d+)[^,]*,\s*(-?\d+)/i))){ if(ok){ const L=+m[2]; if(m[1]==='<') lmin=Math.max(lmin,L); else lmax=lmax?Math.min(lmax,L):L; } continue; }
+      if((m=cmd.match(/^\.(isOnQuest|isNotOnQuest|isQuestTurnedIn|isQuestNotTurnedIn|isQuestComplete|isQuestNotComplete|isQuestAvailable)\s+(.+)$/i))){ if(ok){ const ids=m[2].split(',').map(x=>parseInt(x)).filter(x=>x>0); if(ids.length) reqs.push({k:m[1].toLowerCase(),ids}); } continue; }
+      if((m=cmd.match(/^\.maxlevel\s+(\d+)/i))){ if(ok){ const L=+m[1]+1; lmax=lmax?Math.min(lmax,L):L; } continue; }
+      if((m=cmd.match(/^\.dungeon\s+(!?)\s*([^\s>]+)/i))){ const tag=dgTag(m[2]); (m[1]?dgs:dg).push(tag); continue; }
+      if(/^\.goto\b/i.test(cmd)&&txt&&ok&&!gotoTxt) gotoTxt=txt.trim();
+      { const tm=cmd.match(/^\.target\s+(.+)$/i); if(tm&&ok) tgts.push(tm[1].replace(/^\+/,'').trim()); }
+      if((m=cmd.match(/^\.goto\s+(\d+)\/(\d+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)/i))){ if(!ok) continue; // "uiMapId/continent, worldY, worldX" (Forever guides)
+        const z=zoneFromName(m[1]); const Z=z!=null?META.zones[z]:null; if(!Z){ unknownZones.add(m[1]+'/'+m[2]); continue; } const [Lb,Rb,Tb,Bb]=Z.b; const px=(Lb-(+m[3]))/(Lb-Rb)*100, py=(Tb-(+m[4]))/(Tb-Bb)*100;
+        loc=convertLoc(z,px,py,false); if(loc) gl.push(loc); if(!firstLoc) firstLoc=loc; for(const p of pend) if(!p.loc) p.loc=loc; continue; }
+      if((m=cmd.match(/^\.goto\s+([^,]+),\s*([\d.]+)\s*,\s*([\d.]+)/i))){ if(!ok) continue; const z=zoneFromName(m[1]); if(z==null){ unknownZones.add(m[1].trim()); continue; } loc=convertLoc(z,+m[2],+m[3],convert); if(loc) gl.push(loc); if(!firstLoc) firstLoc=loc; for(const p of pend) if(!p.loc) p.loc=loc; continue; }
+      const mk=(o)=>{ o.cond=ok; o.rx=bi+1; o.loc=loc; o.label=txt; if(o.q&&!Q(o.q)&&txt){ const n=txt.replace(/\|c\w{8}|\|r|\|T[^|]*\|t/g,'').replace(/^(Accept|Turn in|Complete)\s+/i,'').trim(); if(n) o.qn=n; } pend.push(o); return o; };
+      if((m=cmd.match(/^\.accept\s+(\d+)/i))) steps.push(mk({t:'accept',q:+m[1]}));
+      else if((m=cmd.match(/^\.turnin\s+(\d+)/i))) steps.push(mk({t:'turnin',q:+m[1]}));
+      else if((m=cmd.match(/^\.complete\s+(\d+)/i))){ let st2=pend.find(p=>p.t==='complete'&&p.q===+m[1]); if(!seenC.has(+m[1])){ seenC.add(+m[1]); st2=mk({t:'complete',q:+m[1]}); steps.push(st2); } const cc=cmd.match(/@@(\d+)=(\d+)/); if(cc&&st2){ st2.counts=st2.counts||{}; st2.counts[cc[1]]=+cc[2]; } }
+      else if((m=cmd.match(/^\.xp\s+(\d+)(?:\.(\d+))?(?:([+-])(\d+))?\s*$/i))){ let L=+m[1], xp=0; if(m[2]) xp=Math.round(XP_TABLE[L]*(+('0.'+m[2]))); if(m[3]==='+') xp=+m[4]; if(m[3]==='-'){ L=L-1; xp=Math.max(0,XP_TABLE[L]-(+m[4])); } steps.push(mk({t:'grind',mode:'to',level:L,xp,note:txt||'Guide XP checkpoint'})); }
+      else if((m=cmd.match(/^\.(fly|fp)\s+(.+)$/i))) steps.push(mk({t:'travel',kind:m[1].toLowerCase(),text:m[2].trim()}));
+      else if((m=cmd.match(/^\.zone\s+(.+)$/i)) && /Take the (Zeppelin|boat|Deeprun Tram) to/i.test(txt) && typeof RIDES!=='undefined'){ const zid=zoneFromName(m[1]); const kind=txt.match(/Take the (Zeppelin|boat|Deeprun Tram)/i)[1].toLowerCase();
+        let c=RIDES.filter(rd=>rd.zone===zid && rd.kind.toLowerCase()===kind); if(!c.length) c=RIDES.filter(rd=>txt.toLowerCase().includes(rd.dest.toLowerCase()));
+        if(c.length){ const here=loc?zp2plane(loc.z,loc.px,loc.py):null; if(here) c.sort((a,b)=>{ const pa=tpPt(a.from), pb=tpPt(b.from); return Math.hypot(pa.X-here.X,pa.Y-here.Y)-Math.hypot(pb.X-here.X,pb.Y-here.Y); }); steps.push(mk({t:'travel',kind:'ride',ride:c[0].id,text:c[0].text})); }
+        else if(txt) notes.push({txt,ok}); }
+      else if(/^\.home\b/i.test(cmd)) steps.push(mk({t:'travel',kind:'home',text:txt.replace(/^Set your Hearthstone to\s*/i,'')||'Inn'}));
+      else if(/^\.hs\b/i.test(cmd)) steps.push(mk({t:'travel',kind:'hs',text:txt.replace(/^Hearth to\s*/i,'')||'Hearthstone'}));
+      else if(!cmd && txt) notes.push({txt,ok});
+    }
+    for(const p of pend) if(!p.loc) p.loc=firstLoc;
+    const okN=notes.filter(n=>n.ok).map(n=>n.txt), dj=[...new Set([...okN,...disp])].slice(0,2).join(' · '); const mobs=[...new Set(b.lines.map(l=>(l.split('<<')[0].match(/^\.(?:mob|unitscan)\s+(.+)$/i)||[])[1]).filter(Boolean).map(x=>x.replace(/^\+/,'').trim()))]; const hasCmd=b.lines.some(l=>/^[.+>]/.test(l));
+    const nt=dj?{txt:dj,ok:true}:gotoTxt?{txt:gotoTxt,ok:true}:(notes[0]||(mobs.length?{txt:'Kill '+mobs.slice(0,3).join(', '),ok:true}:firstLoc?{txt:'Go to '+zoneName(firstLoc.z),ok:true}:hasCmd?{txt:'Guide step',ok:true}:null));
+    if(!pend.length && nt){ steps.push({t:'travel',kind:firstLoc?'goto':'note',text:nt.txt,loc:firstLoc,cond:bOK&&nt.ok,rx:bi+1,info:true}); }
+    if(reqs.length) for(let k=startN;k<steps.length;k++) steps[k].reqs=reqs;
+    for(let k=startN;k<steps.length;k++){ const x=steps[k]; if(!x.q||Q(x.q)) continue; if((x.t==='accept'||x.t==='turnin')&&tgts.length) x.tgt=tgts[0]; if(x.t==='complete'){ const re=new RegExp('^\\s*\\.complete\\s+'+x.q+'\\b','i'); x.cl=(b.raw||[]).filter(l=>re.test(l)).map(l=>'    '+l.trim());
+        const say=(b.raw||[]).filter(l=>/^\s*>>/.test(l)).map(l=>'    '+l.trim()), tg=(b.raw||[]).filter(l=>/^\s*\.(target|mob|unitscan)\b/i.test(l)).map(l=>'    '+l.trim()); x.cl=[...say,...x.cl,...tg]; x.objs=[];
+        for(const l of b.raw||[]){ const om=l.match(new RegExp('^\\s*\\.complete\\s+'+x.q+'\\s*,\\s*(\\d+)[^-]*(?:--\\s*(.*))?$','i')); if(!om) continue; const txt=(om[2]||'').replace(/\|c\w{8}|\|r|\|T[^|]*\|t/g,'').replace(/^\|?(?:\d+\/\d+)?\s*/,'').trim()||('Objective '+om[1]); x.objs.push({n:+om[1],text:txt,loc:x.loc?{z:x.loc.z,px:+x.loc.px,py:+x.loc.py}:null,tgt:tgts[0]||null,lines:[...say,'    '+l.trim(),...tg]}); } } }
+    if(b.loop&&gl.length>=2){ const lr=['    #loop',...(b.raw||[]).filter(l=>/^\s*\.goto\b/i.test(l))]; for(let k=startN;k<steps.length;k++){ steps[k].path=gl.map(l=>({z:l.z,px:+l.px,py:+l.py})); steps[k].loopRaw=lr; } }
+    for(let k=startN;k<steps.length;k++){ if(b.completewith) steps[k].cw=b.completewith; if(b.sticky||b.completewith) steps[k].sticky=true; if(b.label) steps[k].label=b.label; }
+    if(b.optional) for(let k=startN;k<steps.length;k++) steps[k].gopt=true;
+    if(b.xprate) for(let k=startN;k<steps.length;k++) steps[k].xr=b.xprate;
+    if(disp.length) for(let k=startN;k<steps.length;k++) steps[k].notes=disp.slice(0,6);
+    if(lmin||lmax) for(let k=startN;k<steps.length;k++){ if(lmin) steps[k].lmin=lmin; if(lmax) steps[k].lmax=lmax; }
+    if(dg.length||dgs.length) for(let k=startN;k<steps.length;k++){ if(dg.length) steps[k].dg=[...new Set(dg)]; if(dgs.length) steps[k].dgs=[...new Set(dgs)]; }
+  });
+  const qm={}; steps.forEach(x=>{ if(x.qn&&!qm[x.q]) qm[x.q]=x.qn; }); steps.forEach(x=>{ if(x.q&&!x.qn&&qm[x.q]) x.qn=qm[x.q]; });
+  return {steps,unknownZones:[...unknownZones]};
+}
+/* original guide text per block, kept in IndexedDB so exports can reproduce the guide verbatim */
+const rawCache=new Map(); let rawDBp=null;
+function rawDB(){ if(!rawDBp) rawDBp=new Promise((res)=>{ try{ const rq=indexedDB.open('frp-raw',2); rq.onupgradeneeded=()=>{ const d=rq.result; if(!d.objectStoreNames.contains('g')) d.createObjectStore('g'); if(!d.objectStoreNames.contains('kv')) d.createObjectStore('kv'); }; rq.onsuccess=()=>res(rq.result); rq.onerror=()=>res(null); }catch(e){ res(null); } }); return rawDBp; }
+function kvPut(k,v){ return rawDB().then(db=>new Promise(res=>{ if(!db) return res(false); try{ const t=db.transaction('kv','readwrite'); t.objectStore('kv').put(v,k); t.oncomplete=()=>res(true); t.onerror=t.onabort=()=>res(false); }catch(e){ res(false); } })); }
+function kvDel(k){ rawDB().then(db=>{ try{ db&&db.transaction('kv','readwrite').objectStore('kv').delete(k); }catch(e){} }); }
+async function kvKeys(){ const db=await rawDB(); if(!db) return []; return new Promise(res=>{ try{ const rq=db.transaction('kv').objectStore('kv').getAllKeys(); rq.onsuccess=()=>res(rq.result||[]); rq.onerror=()=>res([]); }catch(e){ res([]); } }); }
+async function kvGet(k){ const db=await rawDB(); if(!db) return null; return new Promise(res=>{ try{ const rq=db.transaction('kv').objectStore('kv').get(k); rq.onsuccess=()=>res(rq.result??null); rq.onerror=()=>res(null); }catch(e){ res(null); } }); }
+function rawPut(id,blocks){ rawCache.set(id,blocks); rawDB().then(db=>{ if(!db) return; try{ db.transaction('g','readwrite').objectStore('g').put(blocks,id); }catch(e){} }); }
+async function rawLoad(ids){ const db=await rawDB(); await Promise.all([...new Set(ids)].filter(id=>!rawCache.has(id)).map(id=>new Promise(res=>{ if(!db) return res(); try{ const rq=db.transaction('g').objectStore('g').get(id); rq.onsuccess=()=>{ if(rq.result) rawCache.set(id,rq.result); res(); }; rq.onerror=()=>res(); }catch(e){ res(); } }))); }
+function importGuides(text,convert){ FQ.key=null;
+  const parsed=parseRXP(text); if(!parsed.length) return {err:'No RestedXP steps found. Paste the whole guide, including the step lines.'};
+  route.guides=route.guides||[]; const added=[], refreshed=[]; const unknown=new Set();
+  for(const pg of parsed){
+    const {steps,unknownZones}=buildGuideSteps(pg,convert); unknownZones.forEach(z=>unknown.add(z)); if(!steps.length) continue;
+    const nm=pg.name||pg.group||'Imported guide'; const ex=route.guides.find(x=>x.name===nm&&x.group===pg.group);
+    if(ex){ // same guide again: swap in the new parse and re-point your route's steps at it, keeping their order
+      rawPut(ex.id,pg.blocks.map(b=>(b.raw||[]).join('\n')));
+      const sig=x=>[x.rx,x.t,x.q||'',x.t==='travel'&&(x.info||x.kind==='note'||x.kind==='goto')?'info':(x.kind||''),x.t==='grind'?x.level:''].join('|'); const pool=new Map(); steps.forEach((x,k)=>{ const k2=sig(x); if(!pool.has(k2)) pool.set(k2,[]); pool.get(k2).push(k); });
+      const map=ex.steps.map(o=>{ const a=pool.get(sig(o)); return a&&a.length?a.shift():-1; });
+      for(const r of store.routes){ r.steps=r.steps.filter(st=>{ if(!st.src||st.src.g!==ex.id) return true; const ni=map[st.src.i];
+          if(ni==null||ni<0){ if(st.t==='travel'&&(st.kind==='note'||st.kind==='goto')&&!st.src.auto) return false; if(st.src.auto){ st.src={...st.src,i:Math.max(0,Math.min(steps.length-1,st.src.i))}; return true; } delete st.src; return true; } // unmatched guide notes are re-added in place by the fill below; other unmatched steps become your own steps
+          st.src.i=ni; const ns=steps[ni]; for(const f of ['reqs','rx','qn','ride','gopt','cw','sticky','label','text','kind','loc']) if(ns[f]!=null) st[f]=ns[f]; return true; }); if(r===route) cursor=Math.min(cursor,r.steps.length-1); }
+      ex.excluded=(ex.excluded||[]).map(i=>map[i]).filter(i=>i>=0); ex.removed=(ex.removed||[]).map(i=>map[i]).filter(i=>i>=0); ex.from=Math.max(0,map[ex.from]??0); ex.steps=steps; ex.pv=3; ex.to=steps.length-1; refreshed.push(ex); continue; }
+    const g={id:uid(),pv:3,name:pg.name||pg.group||'Imported guide',group:pg.group,cond:pg.cond,next:pg.next,ver:pg.ver||'',xprate:pg.xprate||'',color:GCOLORS[route.guides.length%GCOLORS.length],visible:false,from:0,to:steps.length-1,excluded:[],stopAtBlocked:false,includeNotes:true,includeXp:true,steps};
+    route.guides.push(g); added.push(g); rawPut(g.id,pg.blocks.map(b=>(b.raw||[]).join('\n')));
+  }
+  const vis=added.find(x=>guideOK(x))||added[0]; if(vis) vis.visible=true;
+  return {added,refreshed,unknown:[...unknown]};
+}
+
+/* ghost simulation: run the guide from the join step against the state at the cursor */
+function ghostPoint(s,ref){ if(s.loc) return zp2plane(s.loc.z,s.loc.px,s.loc.py); return s.q&&Q(s.q)?stepPoint({...s,loc:null},ref):null; }
+function computeGhosts(){
+  GH=new Map(); if(!route.guides) return;
+  const live=route.steps.filter(s=>!stepActive(s)); const keys=new Set(live.filter(s=>s.q).map(s=>s.t+':'+s.q)); keys.src=new Map(); for(const s of live) if(s.q){ const k=s.t+':'+s.q; if(!keys.src.has(k)) keys.src.set(k,new Set()); keys.src.get(k).add(s.src&&!s.src.auto?s.src.g:'-'); } for(const s of live) if(s.src&&!s.src.auto) keys.add('src:'+s.src.g+':'+s.src.i);
+  for(const g of route.guides) GH.set(g.id,ghostSim(g,keys));
+}
+function ghostSim(g,keys,fromOverride,limit){
+  const st=cloneState(SIM.st); const excl=new Set(g.excluded); const from=fromOverride??g.from, to=fromOverride!=null?g.steps.length-1:g.to;
+  const res=[]; let ref=null; let okRun=0; const skipped=new Set(); const rqCache=new Map(); const gAcc=new Set(g.steps.filter(x=>x.t==='accept'&&x.cond).map(x=>x.q));
+  g.steps.forEach((s,i)=>{
+    const r={i,status:'ok',why:'',gained:0};
+    const pt=ghostPoint(s,ref); r.pt=pt; if(pt) ref=pt;
+    if(limit && i>from+limit){ r.status='outside'; res.push(r); return; }
+    if(!s.cond){ r.status='cond'; r.why='Not for your character'; }
+    else if(!guideOK(g)){ r.status='xprate'; r.why=guideWhy(g); }
+    else if(!xrOK(s.xr)){ r.status='xprate'; r.why='Only at XP rate '+s.xr; }
+    else if(!(r._d=dungeonOK(s)).ok){ r.status='dungeon'; r.why=r._d.why; }
+    else if(s.lmin && st.level<s.lmin){ r.status='level'; r.why='Guide only does this from level '+s.lmin; }
+    else if(s.lmax && st.level>=s.lmax){ r.status='level'; r.why='Guide skips this once you\u2019re level '+s.lmax; }
+    else if(excl.has(i)){ r.status='excl'; r.why='Excluded'; }
+    else if(i<from||i>to){ r.status='outside'; r.why=i<from?'Before the join step':'After the leave step'; }
+    else if((r._rq=(s.reqs&&s.rx?(rqCache.has(s.rx)?rqCache.get(s.rx):(rqCache.set(s.rx,reqFail(s,st)),rqCache.get(s.rx))):reqFail(s,st)))){ r.status='skip'; r.why=r._rq; }
+    else if(s.q && !Q(s.q)){ r.status='unknown'; r.why='Quest '+s.q+' isn\u2019t in the Questie database yet (added without XP)'; }
+    else {
+      const srcs=s.q&&keys.src?.get(s.t+':'+s.q); const inRoute=keys.src?false:(s.q&&keys.has(s.t+':'+s.q)); // guide steps are kept even when the quest is also planned elsewhere (RestedXP skips the repeat itself) // same quest already planned from somewhere else
+      if(s.t==='accept'){ if(st.turned.has(s.q)||st.log.has(s.q)){ r.status='done'; r.why='Already accepted'; } else { const w=whyUnavailable(s.q,st,route); if(w&&w.hard){ r.status='unknown'; r.why=w.why; } else if(w&&w.level&&g.autoGrind!==false){ r.autoGrind=w.level; r.why='catch-up grind to level '+w.level+' first'; r.gained=totalXP(w.level,0)-totalXP(st.level,st.xp); st.level=w.level; st.xp=0; st.log.set(s.q,{done:!hasObjectives(s.q)}); } else if(w){ r.status='blocked'; r.why=w.why; if(w.level) r.needLevel=w.level; } else st.log.set(s.q,{done:!hasObjectives(s.q)}); } }
+      else if(s.t==='complete'){ if(st.turned.has(s.q)||st.log.get(s.q)?.done&&hasObjectives(s.q)){ r.status='done'; r.why='Already done'; } else if(!st.log.has(s.q)){ r.status='blocked'; r.why='Quest not accepted yet'; } else { const e=st.log.get(s.q); const ke=killEstimate(s.q,s.counts,st,i=>e.objs&&e.objs.has(i)); e.done=true; if(ke.xp){ r.gained=ke.xp; addXP(st,ke.xp); } } }
+      else if(s.t==='turnin'){ if(st.turned.has(s.q)){ r.status='done'; r.why='Already turned in'; } else if(!st.log.has(s.q)){ r.status='blocked'; r.why='Not in your quest log'; } else { if(!st.log.get(s.q).done&&hasObjectives(s.q)&&!keys.has('complete:'+s.q)){ r.implicit=true; r.why='objectives completed on the way'; } r.gained=questXP(s.q,st.level); addXP(st,r.gained); st.log.delete(s.q); st.turned.add(s.q); } }
+      else if(s.t==='grind'){ const tgt=totalXP(s.level,s.xp||0), now=totalXP(st.level,st.xp); if(tgt<=now){ r.status='done'; r.why='Already past level '+s.level; } else { r.gained=tgt-now; st.level=Math.min(MAXLVL,s.level); st.xp=st.level>=MAXLVL?0:(s.xp||0); r.status='xp'; } }
+      else if(s.info) r.status='info';
+      if(!s.q && keys.has('src:'+g.id+':'+i) && ['ok','info','xp','done'].includes(r.status)){ r.status='route'; r.why='Already in your route'; }
+      if(inRoute && (r.status==='ok'||r.status==='done')) { r.status='route'; r.why='Already in your route'; }
+    }
+    if(keys.has('src:'+g.id+':'+i) && !['cond','dungeon','xprate','route'].includes(r.status)){ r.status='route'; r.why='Already in your route'; }
+    if(s.q){
+      if(['unknown','cond','dungeon','excl','xprate','level','skip'].includes(r.status) && s.t==='accept') skipped.add(s.q);
+      else if(r.status==='blocked' && s.t!=='accept' && !gAcc.has(s.q) && !keys.has('accept:'+s.q)){ r.status='skip'; r.why='the guide never picks up '+(Q(s.q)?.n||'this quest')+', so this only applies if you already have it'; }
+      else if(r.status==='blocked' && skipped.has(s.q) && s.t!=='accept'){ r.status='unknown'; r.why='Skipped because accepting it was skipped'; }
+      else if(r.status==='blocked' && s.t==='accept'){ const pre=[...(Q(s.q)?.pg||[]),...(Q(s.q)?.ps||[])]; if(pre.length&&pre.some(p=>skipped.has(p))&&/^Requires/.test(r.why)){ r.status='unknown'; r.why='Skipped because an earlier quest in its chain was skipped'; skipped.add(s.q); } }
+    }
+    r.level=st.level+(st.level<MAXLVL?st.xp/XP_TABLE[st.level]:0);
+    res.push(r);
+  });
+  return {res};
+}
+function ghostToStep(g,i){ if(g.removed) g.removed=g.removed.filter(k=>k!==i); const s=g.steps[i]; const o={t:s.t,src:{g:g.id,i}}; for(const k of ['q','mode','level','xp','note','kind','text','counts','gopt','reqs','rx','qn','ride','cw','sticky','label']) if(s[k]!=null) o[k]=s[k]; if(s.loc) o.loc=s.loc; if(s.t==='grind') o.src.xpcheck=true; return o; }
+// add this guide's steps that are missing from the part of the route you already took from it, each placed right after the guide step before it
+function fillGuide(g,dry){
+  const pos=new Map(); route.steps.forEach((s,k)=>{ if(s.src&&!s.src.auto&&s.src.g===g.id&&!pos.has(s.src.i)) pos.set(s.src.i,k); });
+  if(!pos.size) return dry?[]:0; const idx=[...pos.keys()].sort((a,b)=>a-b); let lo=idx[0], hi=idx[idx.length-1]; const miss=[];
+  // also take in the note/travel steps right before and after the stretch you follow (up to the neighbouring quest step)
+  const soft=x=>!x.q||!x.cond||!dungeonOK(x).ok||!xrOK(x.xr); while(lo>0&&soft(g.steps[lo-1])) lo--; while(hi<g.steps.length-1&&soft(g.steps[hi+1])) hi++;
+  const other=new Set(route.steps.filter(s=>s.q&&!(s.src&&s.src.g===g.id)).map(s=>s.t+':'+s.q)); const excl=new Set(g.excluded||[]); const rmv=new Set(g.removed||[]); let added=0; if(!dry) pushHistory();
+  for(let i=lo;i<=hi;i++){ if(pos.has(i)) continue; const s=g.steps[i];
+    if(!s.cond||!xrOK(s.xr)||!dungeonOK(s).ok||excl.has(i)) continue; if(s.info&&!g.includeNotes) continue; if(s.t==='grind'&&!g.includeXp) continue; if(dry){ if(!rmv.has(i)) miss.push(i); continue; }
+    let pj=-1; for(const j of pos.keys()) if(j<i&&j>pj) pj=j; let at; if(pj>=0) at=pos.get(pj)+1; else { let nj=Infinity; for(const j of pos.keys()) if(j>i&&j<nj) nj=j; at=pos.get(nj); }
+    route.steps.splice(at,0,ghostToStep(g,i)); if(cursor>=at) cursor++; for(const [k,v] of pos) if(v>=at) pos.set(k,v+1); pos.set(i,at); added++; }
+  if(dry) return miss; if(!added) history.pop(); return added; }
+// a catch-up grind must not split a guide step from the step it is shown together with (#completewith next)
+function addGrind(add,gr){ let p=add.length; while(p>0&&add[p-1].cw==='next') p--; add.splice(p,0,gr); }
+function connectGuide(g){
+  const auto=g.autoGrind!==false; let added=0, grinds=0, stopped=null, lastLvl=null;
+  pushHistory();
+  for(let guard=0;guard<400;guard++){
+    const gh=GH.get(g.id); const add=[]; let lvl=null; stopped=null;
+    for(let i=g.from;i<=g.to;i++){ const r=gh.res[i]; const s=g.steps[i];
+      if(r.status==='ok'){ if(r.autoGrind) addGrind(add,{t:'grind',mode:'to',level:r.autoGrind,xp:0,src:{g:g.id,i,auto:true},note:`Catch up to level ${r.autoGrind} for "${ghostText(s)}"`}); if(r.implicit) add.push({t:'complete',q:s.q,src:{g:g.id,i}}); add.push(ghostToStep(g,i)); }
+      else if(r.status==='xp'){ if(g.includeXp) add.push(ghostToStep(g,i)); }
+      else if(r.status==='info'){ if(g.includeNotes) add.push(ghostToStep(g,i)); }
+      else if(r.status==='blocked'){
+        if(auto && r.needLevel && !s.gopt && !(lastLvl&&lastLvl.i===i)){ lvl={i,level:r.needLevel}; break; }
+        if(g.stopAtBlocked && !s.opt && !s.gopt){ stopped=i; break; }
+        add.push(ghostToStep(g,i)); // keep it: the route shows why it can't be done yet
+      }
+      else if(['skip','unknown','level'].includes(r.status) || (r.status==='done' && (s.t!=='grind'||g.includeXp))) add.push(ghostToStep(g,i));
+    }
+    if(lvl) addGrind(add,{t:'grind',mode:'to',level:lvl.level,xp:0,src:{g:g.id,i:lvl.i,auto:true},note:`Catch up to level ${lvl.level} for "${ghostText(g.steps[lvl.i])}"`});
+    if(add.length){ route.steps.splice(cursor+1,0,...add); cursor+=add.length; added+=add.length; }
+    if(lvl){ grinds++; lastLvl=lvl; g.from=lvl.i; simulate(); computeGhosts(); continue; }
+    if(stopped!=null) g.from=stopped;
+    break;
+  }
+  if(!added){ history.pop(); const gh=GH.get(g.id); toast(stopped!=null?`Step ${stopped+1} is blocked: ${gh.res[stopped].why}`:'Nothing to add in this range'); refresh(); return; }
+  refresh(); scrollCursor();
+  toast(`Added ${added} step${added>1?'s':''}`+(grinds?` including ${grinds} catch-up grind${grinds>1?'s':''}`:'')+(stopped!=null?` · stopped at blocked step ${stopped+1}`:''));
+}
+function nextGuides(g){ const names=(g.next||'').split(';').map(s=>s.trim().toLowerCase()).filter(Boolean); const f=[]; for(const n of names) for(const x of route.guides||[]) if(x!==g&&x.name.trim().toLowerCase()===n&&!f.includes(x)) f.push(x); const m=f.filter(x=>guideOK(x)).slice(0,1); return {names:(g.next||'').split(';').map(s=>s.trim()).filter(Boolean),found:m.length?m:f}; }
+function continueWith(prev,id){
+  const ng=G(id); if(!ng) return;
+  const left=GH.get(prev.id)?.res.filter(r=>r.i>=prev.from&&r.i<=prev.to&&(r.status==='ok'||r.status==='blocked')).length||0;
+  cursor=route.steps.length-1; selGuide=id; selGhost=null; ng.visible=true; prev.visible=false; ng.from=0; ng.to=ng.steps.length-1; refresh();
+  const first=GH.get(id).res.find(r=>['ok','xp','blocked','info'].includes(r.status));
+  if(first){ ng.from=first.i; selGhost={g:id,i:first.i}; }
+  renderGuides._scroll=true; refresh();
+  const p=first&&GH.get(id).res.slice(first.i).find(r=>r.pt)?.pt; if(p) flyTo(p.X,p.Y,Math.max(view.s,0.06));
+  toast(`Joined ${ng.name} at step ${(first?.i??0)+1}`+(left?` · ${left} step${left>1?'s':''} of ${prev.name} aren't in your route yet`:''));
+}
+function suggestJoin(g){
+  let ref=null; for(let i=cursor;i>=0&&!ref;i--) ref=SIM.res[i]?.pt; if(!ref) ref=SIM.near?.pt;
+  const keys=new Set(route.steps.filter(s=>s.q).map(s=>s.t+':'+s.q));
+  let best=null;
+  g.steps.forEach((s,i)=>{
+    if(s.t!=='accept'||!s.cond||!Q(s.q)||keys.has('accept:'+s.q)) return;
+    if(whyUnavailable(s.q,SIM.st,route)) return;
+    const sim=ghostSim({...g,from:i,to:g.steps.length-1},keys,i,40).res.slice(i,i+40);
+    let run=0; for(const r of sim){ if(r.status==='blocked') break; if(r.status==='ok'||r.status==='xp') run++; }
+    const p=sim[0]?.pt; const d=p&&ref?Math.hypot(p.X-ref.X,p.Y-ref.Y):0;
+    const score=run*300-d; if(!best||score>best.score) best={i,score,run,d};
+  });
+  if(!best){ toast('No step in this guide can be joined from here yet'); return; }
+  g.from=best.i; if(g.to<g.from) g.to=g.steps.length-1; selGhost={g:g.id,i:best.i}; refresh();
+  const p=GH.get(g.id).res[best.i].pt; if(p) flyTo(p.X,p.Y,Math.max(view.s,0.08));
+  toast(`Join at step ${best.i+1}: ${best.run} steps in a row are doable, ${fmt(best.d)} yards away`);
+}
+
+/* drawing */
+function arrow(ax,ay,bx,by,col,label){
+  ctx.strokeStyle=col; ctx.lineWidth=2.2; ctx.setLineDash([2,5]); ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(bx,by); ctx.stroke(); ctx.setLineDash([]);
+  const a=Math.atan2(by-ay,bx-ax); ctx.fillStyle=col; ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(bx-10*Math.cos(a-0.4),by-10*Math.sin(a-0.4)); ctx.lineTo(bx-10*Math.cos(a+0.4),by-10*Math.sin(a+0.4)); ctx.closePath(); ctx.fill();
+  if(label) haloText(label,(ax+bx)/2,(ay+by)/2-9,'600 12px "Alegreya Sans", sans-serif','#fff3c4','rgba(20,12,4,.9)',3);
+}
+function drawGhosts(){
+  if(!layers.ghost||!route.guides) return;
+  for(const g of route.guides){ if(!g.visible) continue; const gh=GH.get(g.id); if(!gh) continue;
+    const nodes=gh.res.filter(r=>r.pt&&!['cond','dungeon','xprate'].includes(r.status));
+    ctx.lineCap='round';
+    for(let k=1;k<nodes.length;k++){ const a=nodes[k-1], b=nodes[k]; const [ax,ay]=toS(a.pt),[bx,by]=toS(b.pt);
+      if(Math.max(ax,bx)<-50||Math.min(ax,bx)>W+50||Math.max(ay,by)<-50||Math.min(ay,by)>H+50) continue;
+      const st=b.status; const inRange=b.i>=g.from&&b.i<=g.to;
+      if(st==='route'||st==='done'){ ctx.strokeStyle=g.color; ctx.globalAlpha=0.25; ctx.lineWidth=1.5; ctx.setLineDash([]); }
+      else if(!inRange||st==='excl'||st==='outside'){ ctx.strokeStyle=g.color; ctx.globalAlpha=0.18; ctx.lineWidth=1.5; ctx.setLineDash([3,6]); }
+      else if(st==='blocked'){ ctx.strokeStyle='#ff6a55'; ctx.globalAlpha=0.8; ctx.lineWidth=2; ctx.setLineDash([4,5]); }
+      else { ctx.strokeStyle=g.color; ctx.globalAlpha=0.85; ctx.lineWidth=2.4; ctx.setLineDash([8,6]); }
+      ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(bx,by); ctx.stroke();
+    }
+    ctx.setLineDash([]); ctx.globalAlpha=1;
+    const showNodes=view.s>0.045; let last=null;
+    for(const r of nodes){ const [x,y]=toS(r.pt); if(x<-20||x>W+20||y<-20||y>H+20) continue;
+      const inRange=r.i>=g.from&&r.i<=g.to; const sel=selGhost&&selGhost.g===g.id&&selGhost.i===r.i;
+      if((r.status==='dungeon'||r.status==='xprate')&&!sel) continue;
+      if(!showNodes && !sel && r.i!==g.from && r.i!==g.to) continue;
+      if(last&&Math.hypot(x-last[0],y-last[1])<9&&!sel) continue; last=[x,y];
+      const faint=!inRange||['route','done','excl','outside'].includes(r.status);
+      ctx.globalAlpha=faint?0.35:1; ctx.fillStyle='#10161a'; ctx.strokeStyle=r.status==='blocked'?'#ff6a55':g.color; ctx.lineWidth=sel?3:1.6;
+      ctx.beginPath(); ctx.arc(x,y,sel?7:5,0,7); ctx.fill(); ctx.stroke();
+      if(r.status==='blocked'){ ctx.strokeStyle='#ff6a55'; ctx.lineWidth=1.6; ctx.beginPath(); ctx.moveTo(x-3,y-3); ctx.lineTo(x+3,y+3); ctx.moveTo(x+3,y-3); ctx.lineTo(x-3,y+3); ctx.stroke(); }
+      else if(r.status==='route'||r.status==='done'){ ctx.fillStyle=g.color; ctx.beginPath(); ctx.arc(x,y,2.5,0,7); ctx.fill(); }
+      ctx.globalAlpha=1;
+      if(view.s>0.12 && !faint) haloText(String(r.i+1),x,y-11,'600 10px "Alegreya Sans", sans-serif',g.color,'rgba(10,10,10,.85)',3);
+      hits.push({x,y,r:8,kind:'ghost',g:g.id,i:r.i});
+    }
+    if(selGuide===g.id){
+      // join / leave connectors
+      let cp=null; for(let i=cursor;i>=0&&!cp;i--) cp=SIM.res[i]?.pt; if(!cp) cp=SIM.near?.pt;
+      const join=gh.res.slice(g.from).find(r=>r.pt&&r.status!=='cond'); const leave=[...gh.res.slice(0,g.to+1)].reverse().find(r=>r.pt&&r.status!=='cond');
+      let np=null; for(let i=cursor+1;i<SIM.res.length&&!np;i++) np=SIM.res[i]?.pt;
+      if(cp&&join){ const [a,b]=toS(cp),[c,d]=toS(join.pt); if(Math.hypot(c-a,d-b)>14) arrow(a,b,c,d,'#ffd24a','Join'); }
+      if(leave&&np){ const [a,b]=toS(leave.pt),[c,d]=toS(np); if(Math.hypot(c-a,d-b)>14) arrow(a,b,c,d,'#ffd24a','Back to route'); }
+    }
+  }
+}
+
+/* guide panel */
+const G=id=>route.guides?.find(g=>g.id===id);
+function ghostIcon(s){ return {accept:'!',turnin:'?',complete:'✓',grind:'⚔',travel:'➤'}[s.t]||'·'; }
+function ghostText(s){ const q=s.q&&Q(s.q); const qn=q?q.n:(s.q?(s.qn||'Quest '+s.q):'');
+  switch(s.t){ case 'accept': return 'Accept '+qn; case 'turnin': return 'Turn in '+qn; case 'complete': return 'Complete '+qn;
+    case 'grind': return `Reach level ${s.level}${s.xp?' + '+fmt(s.xp)+' XP':''}`;
+    case 'prof': return s.act==='craft'?'Craft '+s.item:(s.act==='learn'?'Learn ':'Train ')+s.prof;
+    case 'deathskip': return 'Die and res';
+    case 'collect': return 'Loot '+(DB.i[s.item]?.n||'item');
+    case 'train': return 'Train class spells';
+    case 'buy': return 'Buy from '+(vendorOf(s.npc)?.name||'vendor');
+    case 'travel': return ({fly:'Fly to ',fp:'Get flight path: ',home:'Set hearthstone: ',hs:'Hearth to ',goto:'',note:''})[s.kind]+rxpPlain(s.text||''); }
+  return s.text||''; }
+const STLBL={skip:'Guide skips this',level:'Level skip',xprate:'XP rate',unknown:'Skipped',dungeon:'Dungeon',ok:'Doable',xp:'XP checkpoint',info:'Note',blocked:'Blocked',done:'Already done',route:'In your route',outside:'',excl:'Excluded',cond:'Not for your character'};
+function renderGuides(){
+  const gs=(route.guides||[]).filter(x=>guideOK(x)||xrBox.other||x.id===selGuide);
+  if(!selGuide||!G(selGuide)||(!guideOK(G(selGuide))&&!xrBox.other)) selGuide=(gs.find(x=>guideOK(x))||gs[0])?.id||null;
+  const g=G(selGuide);
+  let h=`<div class="gbar"><div class="row"><button class="btn sm gold" id="gImport">Import guide</button>${gs.length?`<select id="gSel" style="flex:1;min-width:0">${guideOptions(gs)}</select>`:''}</div>`;
+  if(!g){ return h+xrBox()+dungeonBox()+`</div><div class="empty">Import a RestedXP guide to see it as a ghost route on the map. You choose where to <b>join</b> it from your route and where to <b>leave</b> it; the guide's steps become real route steps once their prerequisites are met at that point.</div>`; }
+  h+=xrBox()+dungeonBox();
+  h+=`<div class="note" style="color:${rawCache.has(g.id)?'var(--ok)':'var(--warn)'}">${rawCache.has(g.id)?'✓ Original guide text saved: exported steps match the guide exactly':'⚠ Original guide text missing: re-import this guide file so exported steps match it exactly'}</div>`;
+  if(!guideOK(g)) h+=`<div class="reason">${esc(guideWhy(g))}, so its steps are skipped for your character.</div>`;
+  const gh=GH.get(g.id); const res=gh.res; const cnt=s=>res.filter((r,i)=>i>=g.from&&i<=g.to&&r.status===s).length;
+  const firstBlock=res.find((r,i)=>i>=g.from&&i<=g.to&&r.status==='blocked');
+  const opt=(i)=>`<option value="${i}">${i+1}. ${esc(rxpPlain(ghostText(g.steps[i])).slice(0,48))}</option>`;
+  const endLvl=[...res].reverse().find((r,i)=>r.i<=g.to&&r.i>=g.from)?.level;
+  h+=`<div class="row"><span class="gchip" style="background:${g.color}"></span><input type="text" id="gName" value="${esc(g.name)}" aria-label="Guide name" style="flex:1;min-width:0;padding:3px 6px;border:1px solid var(--line);border-radius:5px;background:var(--panel2)"><label><input type="checkbox" id="gVis" ${g.visible?'checked':''}> Show</label><button class="btn sm" id="gDel">Remove</button></div>
+  <div class="row"><label style="flex:1">Join at<select id="gFrom" style="flex:1;min-width:0">${g.steps.map((_,i)=>opt(i)).join('')}</select></label></div>
+  <div class="row"><label style="flex:1">Leave at<select id="gTo" style="flex:1;min-width:0">${g.steps.map((_,i)=>opt(i)).join('')}</select></label></div>
+  ${g.from>0||g.to<g.steps.length-1?`<div class="row"><button class="linkish" id="gReset">Clear join and leave (use the whole guide)</button></div>`:''}
+  <div class="row"><label><input type="checkbox" id="gStop" ${g.stopAtBlocked?'checked':''}> Stop at first blocked step</label></div>
+  <div class="row"><label><input type="checkbox" id="gAuto" ${g.autoGrind!==false?'checked':''}> Add a grind step when only your level blocks a step</label></div>
+  <div class="row"><label><input type="checkbox" id="gXp" ${g.includeXp?'checked':''}> Include XP checkpoints</label><label><input type="checkbox" id="gNotes" ${g.includeNotes?'checked':''}> Include notes</label></div>
+  <div class="gsum">From step ${cursor+1<1?'start':cursor+1} of your route: <b>${cnt('ok')}</b> doable, <b>${cnt('blocked')}</b> blocked, <b>${cnt('route')+cnt('done')}</b> already covered${endLvl?` · ends near level <b>${endLvl.toFixed(1)}</b>`:''}</div>
+  ${firstBlock?`<div class="reason">First blocker, step ${firstBlock.i+1}: ${esc(firstBlock.why)}. <button class="linkish" data-gsel="${firstBlock.i}">Show</button></div>`:''}
+  <div class="row"><button class="btn sm" id="gSuggest">Suggest join point</button><button class="btn sm gold" id="gConnect">Add doable steps to route</button><button class="btn sm" id="gFill" title="Adds this guide's steps that are missing from the part of your route that already follows it, each in its guide position. Nothing is duplicated or moved.">Fill in missing steps in place</button></div>
+  ${(()=>{ const n=nextGuides(g); if(!n.names.length) return ''; return n.found.length?`<div class="row">${n.found.map(x=>`<button class="btn sm" data-gnext="${x.id}">Continue with ${esc(x.name)}</button>`).join('')}</div>`:`<p class="note" style="margin:0">Next guide: ${esc(n.names.join(' or '))}. Import the file that contains it to continue.</p>`; })()}
+  <div class="row"><label>List<select id="gFilt"><option value="relevant">Your character and XP rate</option><option value="range">Join to leave only</option><option value="all">Every step</option></select></label></div></div>`;
+  const rows=[]; g.steps.forEach((s,i)=>{ const r=res[i];
+    const dgb=(s.dg||[]).map(t=>`<span class="gmark" title="Only when running ${esc(dgName(t))}">${esc(t)}</span>`).join('')+(s.dgs||[]).map(t=>`<span class="gmark" title="Skipped when running ${esc(dgName(t))}">no ${esc(t)}</span>`).join('');
+    if(gFilter==='relevant'&&(r.status==='cond'||r.status==='xprate')) return; if(gFilter==='range'&&(i<g.from||i>g.to||r.status==='cond')) return;
+    const sel=selGhost&&selGhost.g===g.id&&selGhost.i===i; const marks=(i===g.from?'<span class="gmark">join</span>':'')+(i===g.to?'<span class="gmark">leave</span>':'');
+    const lbl=r.status==='outside'?'':(STLBL[r.status]+(r.why&&r.status!=='cond'&&r.status!=='route'?': '+r.why:'')+(r.gained?' · +'+fmt(r.gained)+' XP':''));
+    rows.push(`<div class="gstep st-${r.status} ${sel?'sel':''}" data-gstep="${i}" style="--gcol:${g.color}"><input type="checkbox" data-gex="${i}" ${g.excluded.includes(i)?'':'checked'} aria-label="Include step ${i+1}" ${s.cond?'':'disabled'}><span class="gn">${i+1}</span><span class="gi">${ghostIcon(s)}</span><span>${s.info?rxpHTML(s.text||''):esc(rxpPlain(ghostText(s)))}${marks}${dgb}${notesHTML(s)}${lbl?`<span class="gs">${esc(lbl)}</span>`:''}${sel?`<span class="row" style="margin-top:3px"><button class="btn sm" data-gjoin="${i}">Join here</button><button class="btn sm" data-gleave="${i}">Leave here</button><button class="btn sm" data-gone="${i}">Add this step</button></span>`:''}</span><button class="gdel" data-gdel="${i}" title="${r.status==='route'?'Remove this step from your route':'Leave this step out'}" aria-label="Remove step ${i+1}">×</button></div>`);
+  });
+  h+=`<div>${rows.join('')||'<div class="empty">No steps match this filter.</div>'}</div>`;
+  return h;
+}
+function afterGuidesRender(){
+  const g=G(selGuide); const on=(id,ev,fn)=>{ const el=document.getElementById(id); el&&el.addEventListener(ev,fn); };
+  on('gImport','click',openImport);
+  on('gSel','change',e=>{ selGuide=e.target.value; const sg=G(selGuide); if(sg) sg.visible=true; selGhost=null; renderRight(); requestDraw(); });
+  if(!g) return;
+  $('#gFrom').value=g.from; $('#gTo').value=g.to; $('#gFilt').value=gFilter;
+  on('gName','change',e=>{ g.name=e.target.value||'Guide'; save(); renderRight(); });
+  on('gVis','change',e=>{ g.visible=e.target.checked; save(); requestDraw(); });
+  on('gDel','click',async()=>{ if(!await ask('Remove this guide from the route? Steps already added stay.')) return; route.guides=route.guides.filter(x=>x!==g); selGuide=null; refresh(); });
+  on('gFrom','change',e=>{ g.from=+e.target.value; if(g.to<g.from) g.to=g.steps.length-1; refresh(); });
+  on('gTo','change',e=>{ g.to=+e.target.value; if(g.to<g.from) g.from=g.to; refresh(); });
+  on('gReset','click',()=>{ g.from=0; g.to=g.steps.length-1; refresh(); });
+  on('gStop','change',e=>{ g.stopAtBlocked=e.target.checked; save(); });
+  on('gAuto','change',e=>{ g.autoGrind=e.target.checked; save(); });
+  $$('#rightBody [data-gnext]').forEach(b=>b.addEventListener('click',()=>continueWith(g,b.dataset.gnext)));
+  on('gXp','change',e=>{ g.includeXp=e.target.checked; save(); });
+  on('gNotes','change',e=>{ g.includeNotes=e.target.checked; save(); });
+  on('gFilt','change',e=>{ gFilter=e.target.value; renderRight(); });
+  on('gSuggest','click',()=>suggestJoin(g));
+  on('gConnect','click',()=>connectGuide(g));
+  on('gFill','click',()=>{ if(!g.pv){ toast('This guide was imported by an older planner version that left out Forever quests. Import the guide file again (Import button) and the missing steps are added in place.',9000); return; } const n=fillGuide(g); refresh(); toast(n?`Added ${n} missing step${n>1?'s':''} in place`:'Nothing missing: your route already has every step of this guide in that stretch'); });
+  const sel=$('#rightBody .gstep.sel'); if(sel&&renderGuides._scroll){ sel.scrollIntoView({block:'nearest'}); renderGuides._scroll=false; }
+}
+document.addEventListener('click',async e=>{
+  const t=e.target.closest('[data-gdel],[data-gex],[data-gjoin],[data-gleave],[data-gone],[data-gsel],[data-gstep],[data-ghjoin],[data-ghleave],[data-ghone],[data-ghshow]'); if(!t) return;
+  const d=t.dataset;
+  if(d.ghjoin||d.ghleave||d.ghone||d.ghshow){ const [gid,i]=(d.ghjoin||d.ghleave||d.ghone||d.ghshow).split(':'); const g=G(gid); if(!g) return; selGuide=gid; selGhost={g:gid,i:+i}; hidePop();
+    if(d.ghjoin){ g.from=+i; if(g.to<g.from) g.to=g.steps.length-1; } if(d.ghleave){ g.to=+i; if(g.from>g.to) g.from=0; }
+    if(d.ghone){ const r=GH.get(gid).res[+i]; if(r.status==='blocked'&&!await ask('This step is blocked here: '+r.why+'. Add it anyway?')) return; { const s=g.steps[+i], i2=+i; if(r.autoGrind) addStep({t:'grind',mode:'to',level:r.autoGrind,xp:0,src:{g:gid,i:i2,auto:true},note:`Catch up to level ${r.autoGrind} for "${ghostText(s)}"`}); } if(r.implicit) addStep({t:'complete',q:g.steps[+i].q,src:{g:gid,i:+i}}); addStep(ghostToStep(g,+i)); }
+    tab='guides'; renderGuides._scroll=true; openPanel('right'); refresh(); return; }
+  const g=G(selGuide); if(!g) return;
+  if(d.gdel!=null){ e.stopPropagation(); const i=+d.gdel; const s=g.steps[i];
+    const idx=route.steps.map((x,k)=>(x.src&&x.src.g===g.id&&x.src.i===i)||(s.q&&x.q===s.q&&x.t===s.t)?k:-1).filter(k=>k>=0);
+    if(idx.length){ pushHistory(); for(const k of idx.reverse()){ route.steps.splice(k,1); if(cursor>=k) cursor--; } toast('Removed from your route'); }
+    else { if(!g.excluded.includes(i)) g.excluded.push(i); toast('Step left out of this guide'); }
+    refresh(); return; }
+  if(d.gex!=null){ e.stopPropagation(); const i=+d.gex; g.excluded=t.checked?g.excluded.filter(x=>x!==i):[...g.excluded,i]; refresh(); return; }
+  if(d.gjoin!=null){ g.from=+d.gjoin; if(g.to<g.from) g.to=g.steps.length-1; refresh(); return; }
+  if(d.gleave!=null){ g.to=+d.gleave; if(g.from>g.to) g.from=0; refresh(); return; }
+  if(d.gone!=null){ const i=+d.gone; const r=GH.get(g.id).res[i]; if(r.status==='blocked'&&!await ask('This step is blocked here: '+r.why+'. Add it anyway?')) return; { const s=g.steps[i]; if(r.autoGrind) addStep({t:'grind',mode:'to',level:r.autoGrind,xp:0,src:{g:g.id,i,auto:true},note:`Catch up to level ${r.autoGrind} for "${ghostText(s)}"`}); } if(r.implicit) addStep({t:'complete',q:g.steps[i].q,src:{g:g.id,i}}); addStep(ghostToStep(g,i)); return; }
+  if(d.gsel!=null||d.gstep!=null){ const i=+(d.gsel??d.gstep); selGhost={g:g.id,i}; const s=g.steps[i]; if(s.q&&Q(s.q)) selQuest=s.q; renderGuides._scroll=d.gsel!=null; renderRight(); const p=GH.get(g.id).res[i].pt; if(p){ const [x,y]=toS(p); if(x<40||y<40||x>W-40||y>H-40||view.s<0.04) flyTo(p.X,p.Y,Math.max(view.s,0.08)); } requestDraw(); }
+});
+function ghostPopHTML(h){
+  const g=G(h.g); const s=g.steps[h.i]; const r=GH.get(g.id).res[h.i]; const key=g.id+':'+h.i;
+  return `<h4><span class="gchip" style="background:${g.color}"></span>${esc(g.name)} · step ${h.i+1}</h4><div class="it">${s.info?rxpHTML(s.text||''):esc(rxpPlain(ghostText(s)))}${notesHTML(s)}<br><span class="note">${esc(STLBL[r.status]||'')}${r.why?': '+esc(r.why):''}</span>
+  <div class="row"><button class="btn sm gold" data-ghjoin="${key}">Join here</button><button class="btn sm" data-ghleave="${key}">Leave here</button><button class="btn sm" data-ghone="${key}">Add this step</button><button class="btn sm" data-ghshow="${key}">In list</button></div></div>`;
+}
+function openImport(){ $('#impText').value=''; $('#impMsg').textContent=''; $('#dlgImport').showModal(); }
+$('#impFile').addEventListener('change',async e=>{ const f=e.target.files[0]; if(!f) return; $('#impText').value=await f.text(); $('#impMsg').textContent=`Loaded ${f.name} (${fmt(f.size/1024)} KB).`; e.target.value=''; });
+$('#impCancel').addEventListener('click',()=>$('#dlgImport').close());
+$('#impGo').addEventListener('click',()=>{
+  const r=importGuides($('#impText').value,$('#impConvert').checked);
+  if(r.err){ $('#impMsg').textContent=r.err; return; }
+  let filled=0; for(const g of r.refreshed) filled+=fillGuide(g);
+  if(!r.added.length&&r.refreshed.length){ $('#dlgImport').close(); refresh(); toast(`Updated ${r.refreshed.length} guide${r.refreshed.length>1?'s':''} you already had`+(filled?` and added ${filled} missing step${filled>1?'s':''} in their guide positions`:'')+'. Your own steps and order are unchanged.'); return; }
+  if(!r.added.length){ $('#impMsg').textContent='The guide had no steps this planner understands (accept, complete, turn in, xp, fly, flight path, hearth).'; return; }
+  selGuide=(r.added.find(x=>x.visible)||r.added[0]).id; selGhost=null; tab='guides'; $('#dlgImport').close(); refresh(); openPanel('right');
+  const p=GH.get(selGuide).res.find(x=>x.pt)?.pt; if(p) flyTo(p.X,p.Y,Math.max(view.s,0.06));
+  toast(`Imported ${r.added.length} guide${r.added.length>1?'s':''}`+(r.refreshed.length?` · updated ${r.refreshed.length} existing`:'')+(r.unknown.length?` · unknown zones skipped: ${r.unknown.slice(0,3).join(', ')}`:''));
+});
+
+/* ---------- dungeon conditionals (.dungeon TAG / .dungeon !TAG) ---------- */
+const DUNGEONS=[['RFC','Ragefire Chasm'],['DM','The Deadmines'],['WC','Wailing Caverns'],['HOT','The Hall of Thanes'],['ROL','Ruins of Lordaeron'],['SFK','Shadowfang Keep'],['BFD','Blackfathom Deeps'],['EXC','Excavation Site: Wetlands'],['STOCKS','The Stockade'],['GNOMER','Gnomeregan'],['RFK','Razorfen Kraul'],['SM','Scarlet Monastery'],['RFD','Razorfen Downs'],['ULDA','Uldaman'],['ZF',"Zul'Farrak"],['MARA','Maraudon'],['ST','Sunken Temple'],['BRD','Blackrock Depths'],['DME','Dire Maul'],['SCHOLO','Scholomance'],['STRAT','Stratholme'],['LBRS','Lower Blackrock Spire']];
+const DG_ALT={HOTHANES:'HOT','HALL OF THANES':'HOT',THANES:'HOT',LORDAERON:'ROL',RUINS:'ROL',EXCAVATION:'EXC',DEADMINES:'DM',VC:'DM',STOCKADES:'STOCKS',STOCKADE:'STOCKS',"TEMPLE OF ATAL'HAKKAR":'ST',DMW:'DME',DMN:'DME',GNOMEREGAN:'GNOMER',ULDAMAN:'ULDA',MARAUDON:'MARA',STRATHOLME:'STRAT',SCHOLOMANCE:'SCHOLO',"ZUL'FARRAK":'ZF'};
+function dgTag(x){ const u=String(x).trim().toUpperCase(); return DG_ALT[u]||u; }
+function dgName(t){ return (DUNGEONS.find(d=>d[0]===t)||[t,t])[1]; }
+function dgOn(t){ return !!route.char.dungeons?.[t]; }
+function dungeonOK(s){
+  if(s.dgs&&s.dgs.some(dgOn)) return {ok:false,why:'Skipped when you run '+s.dgs.filter(dgOn).map(dgName).join(', ')};
+  const need=(s.dg||[]).filter(t=>!(s.dgs||[]).includes(t));
+  if(need.length && !need.some(dgOn)) return {ok:false,why:'Only when you run '+need.map(dgName).join(' or ')};
+  return {ok:true};
+}
+function guideOptions(gs){ const by=new Map(); for(const x of gs){ const k=x.group||'Imported'; if(!by.has(k)) by.set(k,[]); by.get(k).push(x); }
+  return [...by].map(([k,l])=>`<optgroup label="${esc(k)}">${l.map(x=>`<option value="${x.id}" ${x.id===selGuide?'selected':''}>${esc(x.name)}${guideOK(x)?'':' — '+esc(guideWhy(x).replace(/^Guide is /,''))}</option>`).join('')}</optgroup>`).join(''); }
+const isAoE=g=>/\bAoE\b/i.test((g.group||'')+' '+(g.name||''));
+function guideOK(g){ return !!g&&xrOK(g.xprate)&&!g.ver&&condOK(g.cond||'')&&(!isAoE(g)||!!route.char.aoe); }
+function guideWhy(g){ if(!xrOK(g.xprate)) return 'Guide is for XP rate '+g.xprate; if(g.ver) return 'Guide is '+g.ver.replace(' only',' only'); if(!condOK(g.cond||'')) return 'Guide is for '+g.cond; if(isAoE(g)&&!route.char.aoe) return 'Guide is an AoE mage route (turn on in the XP rate box)'; return ''; }
+function stepActive(s,st){ if(!s.src) return null; const g=G(s.src.g); const gs=g?.steps[s.src.i]; if(!gs) return null; if(!guideOK(g)) return guideWhy(g); if(!gs.cond&&!s.src.auto) return 'Not for your character ('+route.char.race+' '+route.char.cls+'): the guide shows this to other races/classes'; if(!xrOK(gs.xr)) return 'Only at XP rate '+gs.xr; const d=dungeonOK(gs); if(!d.ok) return d.why;
+  if(st&&!s.src.auto){ if(gs.lmin&&st.level<gs.lmin) return 'Guide only does this from level '+gs.lmin; if(gs.lmax&&st.level>=gs.lmax) return 'Guide skips this once you\u2019re level '+gs.lmax; } return null; }
+function allDungeonTags(){ const tags=new Map(DUNGEONS.map(([t])=>[t,0])); for(const g of route.guides||[]) for(const s of g.steps) for(const t of [...(s.dg||[]),...(s.dgs||[])]) tags.set(t,(tags.get(t)||0)+1); return tags; }
+function dungeonChecks(prefix){ const tags=allDungeonTags(); return [...tags].map(([t,n])=>`<label title="${esc(dgName(t))}"><input type="checkbox" data-${prefix}="${esc(t)}" ${dgOn(t)?'checked':''}> ${esc(t==='ST'?'Sunken Temple':dgName(t))}${n?` <span class="note">(${n})</span>`:''}</label>`).join(''); }
+function dungeonBox(){ const on=Object.values(route.char.dungeons||{}).filter(Boolean).length;
+  return `<details class="dgbox" ${dungeonBox.open?'open':''}><summary>Dungeons you'll run (${on} selected)</summary><p class="note" style="margin:4px 0">Guide steps marked <code>.dungeon</code> only apply when that dungeon is ticked; steps marked <code>.dungeon !</code> are skipped when it is. Numbers are guide steps that depend on each dungeon.</p><div class="dggrid">${dungeonChecks('dgon')}</div></details>`; }
+document.addEventListener('toggle',e=>{ if(e.target.classList?.contains('dgbox')) dungeonBox.open=e.target.open; },true);
+document.addEventListener('change',e=>{ const t=e.target.dataset?.dgon; if(t==null) return; setDungeon(t,e.target.checked); });
+function setDungeon(tag,on){
+  route.char.dungeons=route.char.dungeons||{}; if(on) route.char.dungeons[tag]=true; else delete route.char.dungeons[tag];
+  pushHistory(); let added=0; if(on) added=insertNewlyEnabled(); refresh();
+  const off=route.steps.filter(s=>stepActive(s)).length;
+  toast(on?`${dgName(tag)} on`+(added?` · ${added} guide step${added>1?'s':''} added to your route`:''):`${dgName(tag)} off`+(off?` · ${off} route step${off>1?'s':''} now skipped`:''));
+}
+/* when a dungeon is switched on, guide steps inside the part of a guide you've already connected get added in guide order */
+function insertNewlyEnabled(){
+  let added=0;
+  for(const g of route.guides||[]){
+    const idxs=route.steps.map((s,k)=>s.src&&s.src.g===g.id?s.src.i:null).filter(v=>v!=null); if(!idxs.length) continue;
+    const lo=Math.min(...idxs), hi=Math.max(...idxs); const excl=new Set(g.excluded);
+    for(let i=lo+1;i<hi;i++){
+      const s=g.steps[i]; if(!s.cond||excl.has(i)||!(s.dg||s.dgs||s.xr)||!dungeonOK(s).ok||!xrOK(s.xr)||!guideOK(g)) continue;
+      if(s.q&&!Q(s.q)) continue; if(s.info&&!g.includeNotes) continue; if(s.t==='grind'&&!g.includeXp) continue;
+      if(route.steps.some(x=>x.src&&!x.src.auto&&x.src.g===g.id&&x.src.i===i)) continue;
+      if(s.q&&route.steps.some(x=>x.t===s.t&&x.q===s.q)) continue;
+      let pos=-1; route.steps.forEach((x,k)=>{ if(x.src&&x.src.g===g.id&&x.src.i<i) pos=k; });
+      route.steps.splice(pos+1,0,ghostToStep(g,i)); if(pos+1<=cursor) cursor++; added++;
+    }
+  }
+  return added;
+}
+
+/* resizable side panels */
+(function(){ const root=document.documentElement;
+  try{ const w=JSON.parse(localStorage.getItem('frp.widths')||'{}'); if(w.l) root.style.setProperty('--lw',w.l+'px'); if(w.r) root.style.setProperty('--rw',w.r+'px'); }catch(e){}
+  $$('.resizer').forEach(h=>{ h.addEventListener('pointerdown',e=>{ e.preventDefault(); h.setPointerCapture(e.pointerId); h.classList.add('on'); const side=h.dataset.side; const panel=h.parentElement; const x0=e.clientX, w0=panel.getBoundingClientRect().width;
+    const mv=ev=>{ let w=side==='l'?w0+(ev.clientX-x0):w0-(ev.clientX-x0); w=Math.max(240,Math.min(innerWidth*0.55,w)); root.style.setProperty(side==='l'?'--lw':'--rw',Math.round(w)+'px'); };
+    const up=()=>{ h.classList.remove('on'); h.removeEventListener('pointermove',mv); h.removeEventListener('pointerup',up); try{ const o=JSON.parse(localStorage.getItem('frp.widths')||'{}'); o[side]=Math.round((side==='l'?$('#leftPanel'):$('#rightPanel')).getBoundingClientRect().width); localStorage.setItem('frp.widths',JSON.stringify(o)); }catch(_){ } resize(); };
+    h.addEventListener('pointermove',mv); h.addEventListener('pointerup',up); });
+    h.addEventListener('dblclick',()=>{ root.style.removeProperty(h.dataset.side==='l'?'--lw':'--rw'); try{ const o=JSON.parse(localStorage.getItem('frp.widths')||'{}'); delete o[h.dataset.side]; localStorage.setItem('frp.widths',JSON.stringify(o)); }catch(_){ } resize(); }); });
+})();
+
+function ask(msg,okLabel){ $('#askIn').hidden=true; return new Promise(res=>{ const d=$('#dlgAsk'); $('#askMsg').textContent=msg; $('#askOk').textContent=okLabel||'OK';
+  const done=v=>{ d.onclose=null; $('#askOk').onclick=null; $('#askNo').onclick=null; d.close(); res(v); };
+  $('#askOk').onclick=()=>done(true); $('#askNo').onclick=()=>done(false); d.onclose=()=>res(false); d.showModal(); }); }
+
+function askText(msg,def,ok,type){ return new Promise(res=>{ const d=$('#dlgAsk'), inp=$('#askIn'); $('#askMsg').textContent=msg; $('#askOk').textContent=ok||'OK'; inp.type=type||'number'; inp.style.width=type==='text'?'100%':'120px'; inp.hidden=false; inp.value=def||'';
+  const done=v=>{ d.onclose=null; $('#askOk').onclick=null; $('#askNo').onclick=null; inp.onkeydown=null; d.close(); inp.hidden=true; res(v); };
+  $('#askOk').onclick=()=>done(inp.value); $('#askNo').onclick=()=>done(null); inp.onkeydown=e=>{ if(e.key==='Enter'){ e.preventDefault(); done(inp.value); } }; d.onclose=()=>{ inp.hidden=true; res(null); }; d.showModal(); inp.select(); }); }
+
+/* ---------- XP rate conditional (#xprate) ---------- */
+function xrRate(){ return +route.char.xprate||1; }
+function xrOK(str){ if(!str) return true; const rate=xrRate(); let lo=1,hi=4095; const m=String(str).trim().match(/^([<>]?)\s*(\d+\.?\d*)-?(\d*\.?\d*)/); if(!m) return true;
+  if(m[1]==='<'){ lo=0; hi=+m[2]-1e-4; } else if(m[1]==='>'){ lo=+m[2]+1e-4; hi=4095; } else { lo=+m[2]; hi=m[3]?+m[3]:4095; } return rate>=lo&&rate<=hi; }
+const XR_OPTS=[1,1.25,1.5,2,2.5,3];
+function xrBox(){ const r=xrRate(); const opts=XR_OPTS.includes(r)?XR_OPTS:[...XR_OPTS,r].sort((a,b)=>a-b);
+  const tags=new Map(); for(const g of route.guides||[]){ if(g.xprate) tags.set(g.xprate,(tags.get(g.xprate)||0)+g.steps.length); for(const s of g.steps) if(s.xr) tags.set(s.xr,(tags.get(s.xr)||0)+1); }
+  return `<details class="dgbox" ${xrBox.open?'open':''} data-box="xr"><summary>XP rate: ${r}×</summary><div class="row" style="margin:6px 0"><label>Your XP rate<select id="xrSel">${opts.map(o=>`<option value="${o}" ${o===r?'selected':''}>${o}×</option>`).join('')}</select></label></div>
+  <p class="note" style="margin:0 0 4px">Guides and steps with an <code>#xprate</code> line only apply when your rate matches. Guides for another faction or class, Season of Discovery/Mastery, Hardcore or self-found are hidden too; Forever is treated as Classic Era. Normal Classic XP is 1×.</p>${(route.guides||[]).some(isAoE)?`<label style="margin-bottom:4px"><input type="checkbox" id="aoeOn" ${route.char.aoe?'checked':''}> Use AoE mage guides</label>`:''}<label style="margin-bottom:4px"><input type="checkbox" id="xrOther" ${xrBox.other?'checked':''}> Show guides that don't apply to this character</label>${tags.size?`<div class="dggrid">${[...tags].map(([t,n])=>`<span>${xrOK(t)?'✓':'✕'} <code>${esc(t)}</code> <span class="note">(${n})</span></span>`).join('')}</div>`:''}</details>`; }
+document.addEventListener('toggle',e=>{ if(e.target.dataset?.box==='xr') xrBox.open=e.target.open; },true);
+document.addEventListener('change',e=>{ if(e.target.id!=='xrSel') return; setXpRate(+e.target.value); });
+function pruneXpRate(){ let n=0; for(let k=route.steps.length-1;k>=0;k--){ const w=stepActive(route.steps[k]); if(w&&/XP rate|AoE mage/.test(w)){ route.steps.splice(k,1); if(cursor>=k) cursor--; n++; } } return n; }
+function setXpRate(v){ pushHistory(); route.char.xprate=v; const removed=pruneXpRate(); const added=insertNewlyEnabled(); refresh(); if(removed){ toast(`XP rate ${v}× · ${removed} steps for other XP rates removed`+(added?` · ${added} added`:'')); return; } const off=route.steps.filter(s=>stepActive(s)).length; toast(`XP rate ${v}×`+(added?` · ${added} guide steps added`:'')+(off?` · ${off} route steps skipped`:'')); }
+
+document.addEventListener('change',e=>{ if(e.target.id==='aoeOn'){ pushHistory(); route.char.aoe=e.target.checked; pruneXpRate(); refresh(); return; } if(e.target.id==='xrOther'){ xrBox.other=e.target.checked; renderRight(); } });
+
+/* ---------- RestedXP text formatting (|T...|t icons, |cRXP_...|r colours) ---------- */
+const TALK_SVG='<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 3.5C2 2.7 2.7 2 3.5 2h9c.8 0 1.5.7 1.5 1.5v6c0 .8-.7 1.5-1.5 1.5H7l-3.2 2.6c-.3.2-.8 0-.8-.4V11h0c-.6 0-1-.5-1-1.1z" fill="#c9c9c9" stroke="#3a3a3a" stroke-width="1"/><circle cx="5.5" cy="6.5" r=".9" fill="#555"/><circle cx="8" cy="6.5" r=".9" fill="#555"/><circle cx="10.5" cy="6.5" r=".9" fill="#555"/></svg>';
+function rxpIcon(tex){ if(/chatbubble/i.test(tex)) return `<span class="rxi" title="Talk to">${TALK_SVG}</span>`; if(/^\d+/.test(tex)) return '<span class="rxi item" title="Item"></span>'; if(/questturnin|questactive/i.test(tex)) return '<span class="rxi q">?</span>'; if(/available/i.test(tex)) return '<span class="rxi q">!</span>'; return '<span class="rxi item"></span>'; }
+function rxpHTML(str){
+  let s=esc(String(str||'')).replace(/\\n|\|n/g,'<br>');
+  s=s.replace(/\|T([^|]+?)(?::[^|]*)?\|t/gi,(m,t)=>rxpIcon(t));
+  // colour codes can nest ("|cRXP_WARN_Kill |cRXP_ENEMY_Duskbats|r now|r"), so walk them with a stack
+  let out='', depth=0; for(const part of s.split(/(\|c(?:RXP_[A-Z]+_|[0-9a-fA-F]{8})|\|r)/)){ let m;
+    if((m=part.match(/^\|c(?:RXP_([A-Z]+)_|[0-9a-fA-F]{8})$/))){ out+=`<span class="rxc rxc-${(m[1]||'x').toLowerCase()}">`; depth++; }
+    else if(part==='|r'){ if(depth){ out+='</span>'; depth--; } }
+    else out+=part; }
+  return out+'</span>'.repeat(depth);
+}
+function rxpPlain(str){ return String(str||'').replace(/\|T[^|]*\|t/gi,'').replace(/\|c(?:RXP_[A-Z]+_|[0-9a-fA-F]{8})/g,'').replace(/\|r/g,'').replace(/\\n|\|n/g,' ').replace(/\s+/g,' ').trim(); }
+function notesHTML(s,skip){ const ns=(s.notes||[]).filter(n=>!skip||!skip.includes(n)); if(!ns.length) return ''; return `<span class="rxnotes">${ns.map(n=>`<span>${rxpHTML(n)}</span>`).join('')}</span>`; }
+
+
+function fillNodeSel(f,sel){ const list=taxiNodes().sort((x,y)=>x.n.localeCompare(y.n)); const known=SIM.st.fps;
+  f.node.innerHTML='<option value="">Choose…</option>'+list.map(n=>`<option value="${n.id}" ${n.id===sel?'selected':''}>${esc(n.n)}${known.has(n.id)?' ✓':''}</option>`).join('');
+  const upd=()=>{ const fly=f.kind.value==='fly'||f.kind.value==='fp'; $('#travelNode').hidden=!fly; $('#travelText').hidden=fly; }; f.kind.onchange=upd; upd(); }
+
+function fillFpSettings(c){ const list=taxiNodes(c.faction).sort((x,y)=>taxiShort(x.id).localeCompare(taxiShort(y.id))); const set=new Set(c.fps||[]);
+  $('#fpSettings').innerHTML=list.map(n=>`<label><input type="checkbox" data-fpk="${n.id}" ${set.has(n.id)?'checked':''}> ${esc(taxiShort(n.id))}</label>`).join(''); $('#fpAll').checked=!!c.allfps; }
+
+try{ const b=document.querySelector('.brand small'); if(b){ b.textContent='Questie data · v'+BUILD; b.title='Planner version (build time, UK)'; } }catch(e){}
