@@ -28,7 +28,7 @@ const GLP_SLOTS=3; /* Basic Campfire: 3 features (Journeyman, Cooking 90: 5) */
 const glpCfg=()=>store.glp||(store.glp={id:uid(),name:'My group',members:[],guides:[]});
 let GLP_TEXTS=null; /* [{name,text}] kept in the browser database, not the main save */
 async function glpTexts(){ if(GLP_TEXTS) return GLP_TEXTS; try{ GLP_TEXTS=JSON.parse(await kvGet('glp:guides')||'[]'); }catch(e){ GLP_TEXTS=[]; } return GLP_TEXTS; }
-function glpFac(race){ return (RACES[race]||[0,'H'])[1]||'H'; }
+function glpFac(race,m){ return (RACES[race]||[0,'H'])[1]||m?.fac||'A'; }
 
 /* ---------- camp advisor ---------- */
 function campValue(prof,mem){ const C=CAMP[prof]; let v=0; const notes=[]; let waste=0;
@@ -73,7 +73,7 @@ function profTrainers(prof){ const fac=charInfo(route).fac; return Object.keys(M
 function glpBlk(s){ if(!s?.src||s.src.auto) return null; const g=G(s.src.g); const x=g?.steps[s.src.i]; return x?.rx?g.id+':'+x.rx:null; }
 function glpInsert(at,step){ while(at>0&&at<route.steps.length&&glpBlk(route.steps[at-1])&&glpBlk(route.steps[at-1])===glpBlk(route.steps[at])) at++; /* never split a guide step in two */ route.steps.splice(at,0,{...step,id:uid(),glp:1}); simulate(); return at; }
 const THR=180;
-const GLP_START={Human:['elwynn','northshire'],Dwarf:['dun morogh','coldridge'],Gnome:['dun morogh','coldridge'],'Night Elf':['teldrassil','shadowglen'],Orc:['durotar','valley of trials'],Troll:['durotar','valley of trials'],Tauren:['mulgore','red cloud','camp narache'],Undead:['tirisfal','deathknell']};
+const GLP_START={Human:['elwynn','northshire'],Dwarf:['dun morogh','coldridge'],Gnome:['dun morogh','coldridge'],'Night Elf':['teldrassil','shadowglen'],Orc:['durotar','valley of trials'],Troll:['durotar','valley of trials'],Tauren:['mulgore','red cloud','camp narache'],Undead:['tirisfal','deathknell'],Skyborne:['zephras','thendal','valanaar']};
 function glpProfSteps(m,campProf){ const notes=[]; const all=[...new Set([...(m.profs||[]),...(campProf?[campProf]:[])])].filter(p=>p!=='Cooking');
   const learned={};
   for(const prof of all){ /* already in the guide? */
@@ -104,7 +104,7 @@ async function glpBuild(){ const cfg=glpCfg(); const texts=await glpTexts(); if(
   const mem=cfg.members; const adv=campAdvise(mem); const old=store.routes.filter(r=>r.glp===cfg.id); GLP_MEET=null; const gid=uid(); const built=[]; const report=[];
   $('#glpMsg').textContent='Building routes…'; await new Promise(r=>setTimeout(r,30));
   for(const [k,m] of mem.entries()){
-    route=newRoute({name:m.name,char:{faction:glpFac(m.race),race:m.race,cls:m.cls,level:1,xp:0,party:mem.length,dungeons:{},xprate:1}}); route.glp=cfg.id; route.group=gid; route.member=true; store.routes.push(route); cursor=-1; history=[];
+    route=newRoute({name:m.name,char:{faction:glpFac(m.race,m),race:m.race,cls:m.cls,level:1,xp:0,party:mem.length,dungeons:{},xprate:1}}); route.glp=cfg.id; route.group=gid; route.member=true; store.routes.push(route); cursor=-1; history=[];
     for(const t of texts) importGuides(t.text,false); refresh();
     const ok=route.guides.filter(guideOK); const refd=new Set(ok.flatMap(g=>nextGuides(g).found||[]).map(g=>g.id)); const heads=ok.filter(x=>!refd.has(x.id)); const sz=GLP_START[m.race]||[];
     const lv0=x=>{ const mm=x.name.match(/^\s*(\d+)\s*-\s*(\d+)\b/); return mm?+mm[1]:99; }; const lvl=ok.filter(x=>lv0(x)<99); const min=Math.min(...lvl.map(lv0));
@@ -120,7 +120,7 @@ async function glpBuild(){ const cfg=glpCfg(); const texts=await glpTexts(); if(
 /* ---------- dialog ---------- */
 function glpRender(){ const cfg=glpCfg(); const mem=cfg.members; const adv=mem.length?campAdvise(mem):null;
   const opt=(arr,v)=>arr.map(n=>`<option${n===v?' selected':''}>${n}</option>`).join('');
-  const raceOpts=v=>Object.keys(RACES).filter(n=>n!=='Skyborne').map(n=>`<option${n===v?' selected':''}>${n}</option>`).join('');
+  const raceOpts=(v,f)=>Object.keys(RACES).flatMap(n=>n==='Skyborne'?[['Skyborne|A','Skyborne (Alliance)'],['Skyborne|H','Skyborne (Horde)']]:[[n,n]]).map(([k,l])=>`<option value="${k}"${k===v||k===v+'|'+f?' selected':''}>${l}</option>`).join('');
   let h=`<div class="row" style="gap:8px;align-items:center"><label style="flex:1">Group name<input type="text" id="glpName" value="${esc(cfg.name)}"></label></div>
   <h4 style="margin:10px 0 4px">1 · Solo guide</h4><div class="note">One or more RestedXP guide files: from the Forever Route Planner, or the stock RestedXP guides. Each member follows the parts for their race and class.</div>
   <div id="glpGuides" class="note" style="margin:4px 0">${(GLP_TEXTS||[]).map((t,i)=>`<div>📄 ${esc(t.name)} <span class="note">(${Math.round(t.text.length/1024)} KB)</span> <button class="btn sm" data-glpdelg="${i}">✕</button></div>`).join('')||'<i>No guide yet.</i>'}</div>
@@ -128,7 +128,7 @@ function glpRender(){ const cfg=glpCfg(); const mem=cfg.members; const adv=mem.l
   <h4 style="margin:12px 0 4px">2 · Group</h4>
   <table class="ptab glptab" style="width:100%"><style>.glptab td{white-space:nowrap;vertical-align:middle}.glptab select,.glptab input{width:auto}.ccol{text-shadow:0 0 2px #000,0 0 1px #000}</style><tr><th>Name</th><th>Race</th><th>Class</th><th>Main professions</th><th>Camp feature</th><th></th></tr>
   ${mem.map((m,i)=>{ const pr=m.profs||[]; const a=adv?.asg[i];
-    return `<tr data-glpm="${i}"><td><input type="text" data-k="name" value="${esc(m.name)}" style="width:100px"></td><td><select data-k="race">${raceOpts(m.race)}</select></td><td><select data-k="cls" class="ccol" style="color:${CLS_COL[m.cls]}">${opt(Object.keys(CLASSES),m.cls)}</select></td>
+    return `<tr data-glpm="${i}"><td><input type="text" data-k="name" value="${esc(m.name)}" style="width:100px"></td><td><select data-k="race">${raceOpts(m.race,m.fac)}</select></td><td><select data-k="cls" class="ccol" style="color:${CLS_COL[m.cls]}">${opt(Object.keys(CLASSES),m.cls)}</select></td>
     <td><select data-k="p0"><option value="">–</option>${opt(GLP_PRIMARY,pr[0])}</select> <select data-k="p1"><option value="">–</option>${opt(GLP_PRIMARY,pr[1])}</select></td>
     <td><select data-k="camp"><option value="auto"${!m.camp||m.camp==='auto'?' selected':''}>Auto${a&&(!m.camp||m.camp==='auto')?': '+CAMP[a].f:''}</option><option value="none"${m.camp==='none'?' selected':''}>None</option>${Object.keys(CAMP).map(p=>`<option value="${p}"${m.camp===p?' selected':''}>${CAMP[p].f} (${p})</option>`).join('')}</select></td>
     <td><button class="btn sm" data-glpdel="${i}">✕</button></td></tr>`; }).join('')}</table>
@@ -152,7 +152,7 @@ $('#dlgGroup').addEventListener('change',async e=>{ const t=e.target; const cfg=
   if(t.id==='glpFile'){ const T=await glpTexts(); for(const f of t.files){ const text=await f.text(); if(!parseRXP(text).length){ toast(`${f.name}: no RestedXP guide found`,3000); continue; } const k=T.findIndex(x=>x.name===f.name); if(k>=0) T[k]={name:f.name,text}; else T.push({name:f.name,text}); } await kvPut('glp:guides',JSON.stringify(T)); t.value=''; glpRender(); return; }
   if(t.id==='glpCHost'){ GLP_CUST.h=+t.value; GLP_CUST.j=null; glpRender(); return; }
   const tr=t.closest('[data-glpm]'); if(!tr) return; const m=cfg.members[+tr.dataset.glpm]; const k=t.dataset.k;
-  if(k==='name') m.name=t.value.trim()||m.name; else if(k==='race'){ m.race=t.value; } else if(k==='cls') m.cls=t.value; else if(k==='camp') m.camp=t.value;
+  if(k==='name') m.name=t.value.trim()||m.name; else if(k==='race'){ const [r,f]=t.value.split('|'); m.race=r; if(f) m.fac=f; else delete m.fac; } else if(k==='cls') m.cls=t.value; else if(k==='camp') m.camp=t.value;
   else if(k==='p0'||k==='p1'){ const pr=[...(m.profs||[])]; pr[k==='p0'?0:1]=t.value||undefined; m.profs=pr.filter(Boolean); }
   save(); glpRender(); });
 $('#dlgGroup').addEventListener('click',async e=>{ const cfg=glpCfg(); const b=e.target.closest('button'); if(!b) return;
@@ -182,7 +182,7 @@ function glpTrack(r){ const R0=route,S0=SIM,st0=r.steps; route=r; if(r.glpSolo) 
     const log=new Map(); const LOG=[]; for(let i=0;i<n;i++){ const s=r.steps[i]; if(SIM.res[i].inactive){ LOG.push(log.size); continue; } if(s.t==='accept'&&s.q) log.set(s.q,1); if(s.t==='turnin'&&s.q) log.delete(s.q); if(s.t==='abandon') log.delete(s.q); LOG.push(log.size); }
     return {r,n,T,P,L,X,G,LOG,ci:charInfo(r)}; } finally{ r.steps=st0; route=R0; SIM=S0; } }
 /* boats and zeppelins between the continents: [faction, zone,x,y (one end), zone,x,y (other end), secs incl. waiting] */
-const GLP_PORTS=[['A',11,4.6,57.0,148,32.4,43.8,330],['A',148,33.2,40.0,141,55.0,93.0,240],['H',14,50.8,13.8,85,60.7,58.8,330],['H',14,50.8,13.8,33,31.6,29.1,330]];
+const GLP_PORTS=[['A',16593,64.9,80.9,1519,39.5,81.5,600],['H',16593,58.2,79.5,1638,45.5,52.0,600],['A',11,4.6,57.0,148,32.4,43.8,330],['A',148,33.2,40.0,141,55.0,93.0,240],['H',14,50.8,13.8,85,60.7,58.8,330],['H',14,50.8,13.8,33,31.6,29.1,330]];
 const GLP_DANGER=[['A',11,20,'the Wetlands']]; /* zones a low-level walk to the port crosses */
 function glpWalk(a,b,L){ const d=Math.hypot(b.X-a.X,b.Y-a.Y); const run=L>=40?11.2:7; return Math.min(d*1.3/run,d>2500&&L>=12?d/30+150:d*1.3/run); }
 function glpTravel(a,b,L,fac){ if(!a||!b) return {s:0,cross:false}; const ma=META.zones[a.z]?.m, mb=META.zones[b.z]?.m;
