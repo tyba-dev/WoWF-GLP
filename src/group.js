@@ -88,6 +88,9 @@ function glpProfSteps(m,campProf){ const notes=[]; const all=[...new Set([...(m.
   if(campProf){ const prof=campProf; const ci=charInfo(route);
     const vs=Object.entries(DB.q).filter(([id,q])=>q.n==='Camping 101: '+prof&&(!q.ra||!ci.rb||(q.ra&ci.rb))).map(([id,q])=>({id:+id,q,gp:(q.s?.n||[]).flatMap(n=>entPts('n',n)),fp:(q.f?.n||[]).flatMap(n=>entPts('n',n))})).filter(v=>v.gp.length&&v.fp.length);
     const li=learned[prof]??-1; if(li<0){ notes.push(`Camping 101: ${prof} needs ${prof} learned first.`); return notes; }
+    { const have=route.steps.find(x=>x.t==='accept'&&Q(x.q)?.n==='Camping 101: '+prof); if(have){ const v=vs.find(v=>v.id===have.q)||{id:have.q,q:Q(have.q),fp:(Q(have.q).f?.n||[]).flatMap(n=>entPts('n',n))}; const ai=route.steps.indexOf(have);
+      if(route.steps.some(x=>x.t==='turnin'&&x.q===have.q)) return notes; const Lr=Math.max(PROF20[prof]?.lv||10,lvAt(li)+2); const ok=i=>lvAt(i)>=Lr; const f0=route.steps.findIndex((x,i)=>i>ai&&ok(i)); const t=f0<0?null:glpPlace(v.fp,f0,Math.min(route.steps.length-1,f0+60),ok);
+      if(t){ const cix=glpInsert(t.i+1,{t:'complete',q:v.id}); glpInsert(cix+1,{t:'turnin',q:v.id,unote:`Needs ${prof} 20. Learn the ${CAMP[prof]?.f||'camp'} recipe and add it to the group campfire.`}); if(t.detour) notes.push(`Camping 101: ${prof} hand-in is a ${Math.round(t.d)} yd detour (step ${t.i+2}).`); } return notes; } }
     const tgo=route.steps.findIndex(s=>s.t==='turnin'&&/^The Great Outdoors$/.test(Q(s.q)?.n||'')); const from=Math.max(li,tgo);
     if(tgo<0){ notes.push(`The guide doesn't do The Great Outdoors (starter-zone camp quest), so Camping 101: ${prof} isn't added: pick it up at your starter camp, and hand it in to a ${prof} trainer at skill 20.`); return notes; }
     let best=null; for(const v of vs){ const a=glpPlace(v.gp,from,from); if(!a) continue; if(!best||(!a.detour&&best.a.detour)||(!!a.detour===!!best.a.detour&&a.i<best.a.i)) best={v,a}; }
