@@ -252,8 +252,9 @@ async function glpApplyMeet(o,TR){ const H=TR[o.h]; const host=H.r; const pj=H.P
   for(const [m,x] of o.es.entries()){ const r=TR[m].r; if(!r.glpSolo) r.glpSolo=JSON.parse(JSON.stringify(r.steps)); if(!host.glpSolo) host.glpSolo=JSON.parse(JSON.stringify(host.steps));
     if(m===o.h){ r.steps=JSON.parse(JSON.stringify(r.glpSolo)); r.steps.splice(o.j,0,{id:uid(),t:'travel',kind:'note',text:`Meet the group here (${where})`,glp:1}); continue; }
     const e=o.exitR?.[m]?.[1]??x.e; const tr=glpTravel(TR[m].P[e],pj,TR[m].L[e],TR[m].ci.fac); const base=JSON.parse(JSON.stringify(r.glpSolo)).slice(0,e+1);
+    { const R0b=route,st0=r.steps,c0=cursor; route=r; r.steps=base; cursor=base.length-1; simulate(); const later=new Set(host.glpSolo.slice(o.j).filter(x=>x.q).map(x=>x.q)); const ab=[...SIM.st.log.keys()].filter(q=>!later.has(q)); r.steps=st0; route=R0b; cursor=c0; for(const q of ab) base.push({id:uid(),t:'abandon',q,glp:1}); }
     base.push({id:uid(),t:'travel',kind:'note',text:`Leave your solo route here: go to ${where} and meet ${host.name}${tr.cross?' (take the boat/zeppelin)':''}. If you're ahead, keep questing and leave later; if behind, leave earlier.`,glp:1});
-    const R0=route; route=host; const tail=host.glpSolo.slice(o.j).map(st=>stepFor(r,st)).map(st=>{ if(!st.src){ delete st.cw; } return st; }); route=R0; r.steps=[...base,...tail]; r.glpMeet={h:host.id,j:o.j,e};
+    const R0=route; route=host; const rcb=charInfo(r).cb; const tail=host.glpSolo.slice(o.j).filter(st=>!st.glp&&!(st.q&&Q(st.q)?.cl&&!(Q(st.q).cl&rcb))).map(st=>stepFor(r,st)).map(st=>{ if(!st.src){ delete st.cw; } return st; }); route=R0; r.steps=[...base,...tail]; r.glpMeet={h:host.id,j:o.j,e};
     /* add this member's own class/race steps from the guides they now follow */
     const tg=[...new Set(tail.filter(x=>x.src&&!x.src.auto).map(x=>x.src.g))]; route=r; await rawLoad(tg); simulate(); for(const id of tg){ const g=G(id); if(g) fillGuide(g); }
     /* drop what this member can't do on the joined route: hand-ins for quests they never picked up, quests for other races/classes */
