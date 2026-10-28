@@ -242,7 +242,7 @@ function saveNow(){ store.savedAt=Date.now(); if(route) route.savedAt=store.save
   try{ localStorage.setItem(LS,txt); lsOK=true; }catch(e){ // too big for browser storage: keep a copy without the guide text (that also lives in the database); never delete the old copy
     try{ localStorage.setItem(LS,JSON.stringify(store,(k,v)=>k==='raw'?undefined:v)); lsOK=true; }catch(_){ } }
   for(const r of store.routes) if(r.savedAt) kvPut('route:'+r.id,JSON.stringify(r)); // each route also on its own, so one bad load can never wipe the others
-  kvPut('store',txt).then(ok=>{ const bad=!ok&&!lsOK; const b=document.getElementById('saveWarn'); if(b) b.hidden=!bad; }); }
+  kvPut('store',txt).then(ok=>{ const bad=!ok&&!lsOK; const b=document.getElementById('saveWarn'); if(b) b.hidden=!bad; }); if(typeof clSchedule==='function') clSchedule(); }
 addEventListener('pagehide',()=>{ if(saveT){ clearTimeout(saveT); saveNow(); } });
 async function loadCatalog(){ try{ const c=JSON.parse(await kvGet('catalog')||'null'); if(Array.isArray(c)&&(!store.catalog||c.length>=store.catalog.length)) store.catalog=c; }catch(e){} }
 async function loadStore(){
@@ -1936,7 +1936,7 @@ canvas.addEventListener('pointerdown',()=>{ if(innerWidth<=900) closePanels(); }
   $('#zoneJump').innerHTML='<option value="">Jump to zone…</option>'+Object.entries(META.zones).sort((a,b)=>a[1].n.localeCompare(b[1].n)).map(([z,Z])=>`<option value="${z}">${esc(Z.n)}${Z.lv?' ('+Z.lv+')':''}</option>`).join('');
   await loadStore(); await loadCatalog(); new ResizeObserver(resize).observe(canvas); resize();
   rawLoad(store.routes.flatMap(r=>(r.guides||[]).map(g=>g.id))).then(()=>{ if(tab==='guides') renderRight(); });
-  refresh();
+  refresh(); if(typeof cloudInit==='function') cloudInit();
   const first=SIM.res.find(r=>r.pt)?.pt;
   if(first) flyTo(first.X,first.Y,0.12); else { const n=SIM.near?.pt; if(n) flyTo(n.X,n.Y,0.1); else fitAll(); }
   if(innerWidth<=900) $('#layers').open=false;
