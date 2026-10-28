@@ -7,7 +7,7 @@
 const CLOUD={db:null,on:false,revs:{},sent:{},guides:new Set(),busy:false,again:false,timer:null};
 const CL_PART=150000;
 const clSplit=s=>{ const a=[]; for(let i=0;i<s.length;i+=CL_PART) a.push(s.slice(i,i+CL_PART)); return a.length?a:['']; };
-const clRouteJSON=r=>JSON.stringify(r,(k,v)=>k==='raw'?undefined:v);
+const clRouteJSON=r=>JSON.stringify(r,(k,v)=>k==='raw'||k==='savedAt'?undefined:v);
 function clBadge(t,warn){ const b=document.getElementById('cloudBadge'); if(!b) return; b.hidden=false; b.textContent=t; b.style.color=warn?'var(--danger)':''; }
 async function clReadParts(base,n){ const out=[]; for(let k=0;k<n;k++){ const d=await CLOUD.db.doc(base+'/parts/'+k).get(); out.push(d.exists?String(d.data().s||''):''); } return out.join(''); }
 async function clEnsureGuides(r){ for(const g of r.guides||[]){ if(rawCache.has(g.id)) continue; await rawLoad([g.id]); if(rawCache.has(g.id)) continue;
